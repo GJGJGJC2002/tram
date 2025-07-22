@@ -67,15 +67,16 @@ def est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=None,
     # Stage 1: Iterative steps
     s = pred_depth / slam_depth
 
-    robust = (msk<0.5) * (0<pred_depth) * (pred_depth<10)
-    s_est = s[robust]
-    scale = np.median(s_est)
+    robust = (msk<0.5) * (0<pred_depth) * (pred_depth<10) #背景部分的点云
+    s_est = s[robust] #背景部分的点云的深度比
+    scale = np.median(s_est) #取中值
 
     for _ in range(10):
         slam_depth_0 = slam_depth * scale
         robust = (msk<0.5) * (0<slam_depth_0) * (slam_depth_0<far_thresh) * (0<pred_depth) * (pred_depth<far_thresh)
-        s_est = s[robust]
+        s_est = s[robust] #做十次迭代取中值的过程
         scale = np.median(s_est)
+
 
 
     # Stage 2: Robust optimization
@@ -91,7 +92,7 @@ def est_scale_hybrid(slam_depth, pred_depth, sigma=0.5, msk=None,
     x0 = torch.tensor([scale])
     result = minimize(f, x0,  method='bfgs')
     scale = result.x.detach().cpu().item()
-
+    
     return scale
 
 

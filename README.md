@@ -40,6 +40,10 @@ This project integrates the complete 4D human system, including tracking, slam, 
 
 ```bash
 # 1. Run Masked Droid SLAM (also detect+track humans in this step)
+proxychains python scripts/estimate_camera.py --video "/home/gejunchen/Work/2024-10/Dataset/HMR/my3.mp4"
+
+proxychains python scripts/estimate_camera.py --video "/home/gejunchen/Work/2024-11/Dataset/EMDB/P0/00_mvs_a/P0_00_mvs_a_video.mp4"
+
 python scripts/estimate_camera.py --video "./example_video.mov" 
 # -- You can indicate if the camera is static. The algorithm will try to catch it as well.
 python scripts/estimate_camera.py --video "./another_video.mov" --static_camera

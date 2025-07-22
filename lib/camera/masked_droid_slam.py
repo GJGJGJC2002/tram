@@ -79,13 +79,14 @@ def run_metric_slam(img_folder, masks=None, calib=None, is_static=False):
         scale = est_scale_hybrid(slam_depth, pred_depth, msk=msk)
         scales_.append(scale)
     scale = np.median(scales_)
-    
+    print("tstamp", tstamp)
+    pred_slam_depth = np.array([1/d * scale for d in disps])
     # convert to metric-scale camera extrinsics: R_wc, T_wc
     pred_cam_t = torch.tensor(traj[:, :3]) * scale
     pred_cam_q = torch.tensor(traj[:, 3:])
     pred_cam_r = quaternion_to_matrix(pred_cam_q[:,[3,0,1,2]])
 
-    return pred_cam_r, pred_cam_t
+    return pred_cam_r, pred_cam_t, pred_slam_depth, tstamp
 
 
 def run_slam(imagedir, masks=None, calib=None, depth=None):

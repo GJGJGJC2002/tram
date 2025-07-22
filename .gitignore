@@ -42,3 +42,6 @@ ipython_config.py
 
 # pyenv
 .python-version
+
+tram_results/
+3dpw_results/

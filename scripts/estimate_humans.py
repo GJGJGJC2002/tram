@@ -48,6 +48,7 @@ for k, trk in enumerate(tracks):
     valid = np.array([t['det'] for t in trk])
     boxes = np.concatenate([t['det_box'] for t in trk])
     frame = np.array([t['frame'] for t in trk])
+    print(f'Processing track {k+1}/{len(tracks)} ...')
     results = model.inference(imgfiles, boxes, valid=valid, frame=frame,
                               img_focal=img_focal, img_center=img_center)
     

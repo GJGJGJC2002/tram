@@ -44,13 +44,26 @@ masks = np.array([masktool.decode(m) for m in masks_])
 masks = torch.from_numpy(masks)
 
 cam_int, is_static = calibrate_intrinsics(img_folder, masks, is_static=args.static_camera)
-cam_R, cam_T = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
 
-camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(), 
+if is_static:
+    print('Static camera')
+    cam_R, cam_T = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
+    camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(), 
           'img_focal': cam_int[0], 'img_center': cam_int[2:]}
+    np.save(f'{seq_folder}/camera.npy', camera)
+    np.save(f'{seq_folder}/boxes.npy', boxes_)
+    np.save(f'{seq_folder}/masks.npy', masks_)
+    np.save(f'{seq_folder}/tracks.npy', tracks_)
+else:
+    cam_R, cam_T, slam_depth, key_frame = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
+    camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(), 
+            'img_focal': cam_int[0], 'img_center': cam_int[2:]}
 
-np.save(f'{seq_folder}/camera.npy', camera)
-np.save(f'{seq_folder}/boxes.npy', boxes_)
-np.save(f'{seq_folder}/masks.npy', masks_)
-np.save(f'{seq_folder}/tracks.npy', tracks_)
+    print("get slam_depth", slam_depth.shape) #(96, 328, 584)
+    np.save(f'{seq_folder}/key_frame.npy', key_frame)
+    np.save(f'{seq_folder}/depth.npy', slam_depth)
+    np.save(f'{seq_folder}/camera.npy', camera)
+    np.save(f'{seq_folder}/boxes.npy', boxes_)
+    np.save(f'{seq_folder}/masks.npy', masks_)
+    np.save(f'{seq_folder}/tracks.npy', tracks_)
 

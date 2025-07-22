@@ -31,17 +31,18 @@ def visualize_tram(seq_folder, contact_frames=None, floor_scale=2,
 
     ##### TRAM + VIMO #####
     pred_cam = np.load(f'{seq_folder}/camera.npy', allow_pickle=True).item()
+    #print("pred_cam", pred_cam.shape)
     img_focal = pred_cam['img_focal'].item()
     pred_cam_R = torch.tensor(pred_cam['pred_cam_R'])
     pred_cam_T = torch.tensor(pred_cam['pred_cam_T'])
-
     for i in range(max_track):
         hps_file = hps_files[i]
-
         pred_smpl = np.load(hps_file, allow_pickle=True).item()
+        
         pred_rotmat = pred_smpl['pred_rotmat']
         pred_shape = pred_smpl['pred_shape']
         pred_trans = pred_smpl['pred_trans']
+        
         frame = pred_smpl['frame']
 
         mean_shape = pred_shape.mean(dim=0, keepdim=True)
@@ -58,7 +59,7 @@ def visualize_tram(seq_folder, contact_frames=None, floor_scale=2,
 
         cam_r = pred_cam_R[frame]
         cam_t = pred_cam_T[frame]
-
+        #转到世界坐标系 原来是cam_r是t从相机坐标系到世界坐标系的转化？
         pred_vert_w = torch.einsum('bij,bnj->bni', cam_r, pred_vert) + cam_t[:,None]
         pred_j3d_w = torch.einsum('bij,bnj->bni', cam_r, pred_j3d) + cam_t[:,None]
         pred_vert_w, pred_j3d_w = traj_filter(pred_vert_w, pred_j3d_w)
