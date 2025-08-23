@@ -25,19 +25,31 @@ EMDB_ROOT         = join(ROOT, 'emdb')
 # Path to test/train npz files
 DATASET_FILES = [ {
                    'emdb_1': join(DATASET_NPZ_PATH , 'emdb_1.npz'),
-                   '3dpw_vid_test': join(DATASET_NPZ_PATH , '3dpw_vid_test.npz'),
+                   '3dpw_vid': join(DATASET_NPZ_PATH , '3dpw_vid_test.npz'),
                   },
 
                   {
                    '3dpw_vid': join(DATASET_NPZ_PATH , '3dpw_vid_train.npz'),
                    'h36m_vid': join(DATASET_NPZ_PATH , 'h36m_train.npz'),
-                   'bedlam_vid': join(DATASET_NPZ_PATH , 'bedlam_vid.npz'),
+                   #'bedlam_vid': join(DATASET_NPZ_PATH , 'bedlam_vid.npz'),
+                  }
+                ]
+
+EXTRA_DATASET_FILES = [ {
+                   'emdb_1': join(DATASET_NPZ_PATH , 'emdb_1_extra.npz'),
+                   '3dpw_vid': join(DATASET_NPZ_PATH , '3dpw_vid_test_extra.npz'),
+                  },
+
+                  {
+                   '3dpw_vid': join(DATASET_NPZ_PATH , '3dpw_vid_train_extra.npz'),
+                   'h36m_vid': join(DATASET_NPZ_PATH , 'h36m_train_extra.npz'),
+                   #'bedlam_vid': join(DATASET_NPZ_PATH , 'bedlam_vid.npz'),
                   }
                 ]
 
 DATASET_FOLDERS = {'h36m_vid': H36M_ROOT,
                    '3dpw_vid': PW3D_ROOT,
-                   'bedlam_vid': BEDLAM_ROOT,
+                   #'bedlam_vid': BEDLAM_ROOT,
                    'emdb_1': EMDB_ROOT,
                    '3dpw_vid_test': PW3D_ROOT,
                 }

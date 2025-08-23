@@ -29,7 +29,11 @@ def keypoint_loss(batch, openpose_weight=0., gt_weight=1.):
     loss = (conf * mse).mean()
     return loss
 
+def my_keypoint_loss(batch):
+    pred_keypoints_3d = batch['pred_keypoints_3d']
+    gt_keypoints_3d = batch['pose_3d']
 
+    
 def keypoint_3d_loss(batch):
     """Compute 3D keypoint loss for the examples that 3D keypoint annotations are available.
     The loss is weighted by the confidence.
@@ -43,6 +47,8 @@ def keypoint_3d_loss(batch):
     conf = gt_keypoints_3d[:, :, -1].unsqueeze(-1).clone()
     gt_keypoints_3d = gt_keypoints_3d[:, :, :-1].clone()
     gt_keypoints_3d = gt_keypoints_3d[has_pose_3d == 1]
+    # print('gt_keypoints_3d', gt_keypoints_3d.shape) #(B*seq_len, 24, 3)
+    # print('pred_keypoints_3d', pred_keypoints_3d.shape)
     conf = conf[has_pose_3d == 1]
     pred_keypoints_3d = pred_keypoints_3d[has_pose_3d == 1]
 
@@ -207,6 +213,12 @@ def cam_loss(batch):
 
     return loss.clamp(min=None, max=10.0)
 
+
+# LOSS:
+#   KPT2D: 5.0
+#   KPT3D: 5.0
+#   SMPL_PLUS: 1.0
+#   V3D: 1.0
 
 collection = {'KPT2D': keypoint_loss, 'KPT3D': keypoint_3d_loss, 'SMPL':  smpl_losses,
               'CAM_S': cam_depth_loss, 'CAM': cam_loss, 'V3D': vertice_loss, 'ACCEL': acceleration_loss,

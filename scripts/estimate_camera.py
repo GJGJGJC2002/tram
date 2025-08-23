@@ -45,11 +45,11 @@ masks = torch.from_numpy(masks)
 
 cam_int, is_static = calibrate_intrinsics(img_folder, masks, is_static=args.static_camera)
 cam_R, cam_T = run_metric_slam(img_folder, masks=masks, calib=cam_int, is_static=is_static)
-wd_cam_R, wd_cam_T, spec_f = align_cam_to_world(imgfiles[0], cam_R, cam_T)
-
+#wd_cam_R, wd_cam_T, spec_f = align_cam_to_world(imgfiles[0], cam_R, cam_T)
+wd_cam_R, wd_cam_T = cam_R, cam_T
 camera = {'pred_cam_R': cam_R.numpy(), 'pred_cam_T': cam_T.numpy(), 
           'world_cam_R': wd_cam_R.numpy(), 'world_cam_T': wd_cam_T.numpy(),
-          'img_focal': cam_int[0], 'img_center': cam_int[2:], 'spec_focal': spec_f}
+          'img_focal': cam_int[0], 'img_center': cam_int[2:]}
 
 np.save(f'{seq_folder}/camera.npy', camera)
 np.save(f'{seq_folder}/boxes.npy', boxes_)

@@ -25,7 +25,7 @@ input_dir = args.input_dir
 # EMDB dataset and splits
 roots = []
 for p in range(10):
-    folder = f'/mnt/kostas-graid/datasets/yufu/emdb/P{p}'
+    folder = f'/home/gejunchen/Work/2024-11/Dataset/EMDB/P{p}'
     root = sorted(glob(f'{folder}/*'))
     roots.extend(root)
 
@@ -185,6 +185,11 @@ for k, v in accumulator.items():
 
 # Evaluation: Camera motion
 results = {}
+short_result = []
+mid_result = []
+long_result = []
+video_lens = []
+
 for root in emdb:
     # Annotation
     annfile = f'{root}/{root.split("/")[-2]}_{root.split("/")[-1]}_data.pkl'
@@ -194,9 +199,12 @@ for root in emdb:
     cam_r = ext[:,:3,:3].transpose(0,2,1)
     cam_t = np.einsum('bij, bj->bi', cam_r, -ext[:, :3, -1])
     cam_q = matrix_to_quaternion(torch.from_numpy(cam_r)).numpy()
-
+    video_len = cam_r.shape[0]
+    #print(f"Video length: {video_len}")
+    video_lens.append(video_len)
     # PRED
     seq = root.split('/')[-1]
+    print(f"Evaluating {seq}...")
     pred_cam = dict(np.load(f'{input_dir}/camera/{seq}.npz'))
 
     pred_camt = torch.tensor(pred_cam['pred_cam_T'])
@@ -206,7 +214,7 @@ for root in emdb:
 
     stats_slam, _, _ = eval_slam(pred_traj.copy(), cam_t, cam_q, correct_scale=True)
     stats_metric, traj_ref, traj_est = eval_slam(pred_traj.copy(), cam_t, cam_q, correct_scale=False)
-  
+    print(f"SLAM stats: {stats_slam}")
     # Save results
     re = {'traj_gt': traj_ref.positions_xyz,
           'traj_est': traj_est.positions_xyz, 
@@ -216,9 +224,34 @@ for root in emdb:
           'stats_metric': stats_metric}
     
     results[seq] = re
+    
+    if video_len < 1200:
+        short_result.append(re)
+    elif video_len < 1950:
+        mid_result.append(re)
+    else:
+        long_result.append(re)
+
+video_lens = sorted(video_lens)
+print(f"Video lengths: {video_lens}")
 
 ate = np.mean([re['stats_slam']['mean'] for re in results.values()])
 ate_s = np.mean([re['stats_metric']['mean'] for re in results.values()])
+
+short_ate = np.mean([re['stats_slam']['mean'] for re in short_result])
+mid_ate = np.mean([re['stats_slam']['mean'] for re in mid_result])
+long_ate = np.mean([re['stats_slam']['mean'] for re in long_result])
+short_ate_s = np.mean([re['stats_metric']['mean'] for re in short_result])
+mid_ate_s = np.mean([re['stats_metric']['mean'] for re in mid_result])
+long_ate_s = np.mean([re['stats_metric']['mean'] for re in long_result])
+
+accumulator['short_ate'] = short_ate
+accumulator['mid_ate'] = mid_ate
+accumulator['long_ate'] = long_ate
+accumulator['short_ate_s'] = short_ate_s
+accumulator['mid_ate_s'] = mid_ate_s
+accumulator['long_ate_s'] = long_ate_s
+
 accumulator['ate'] = ate
 accumulator['ate_s'] = ate_s
 

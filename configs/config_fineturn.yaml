@@ -1,3 +1,4 @@
+TRAIN_SCENE: True
 LOGDIR: ''
 DEVICE: 'cuda'
 OUTPUT_DIR: 'results'
@@ -6,8 +7,8 @@ SEED_VALUE: 0
 IMG_RES: 256
 
 DATASET:
-  LIST: ['3dpw_vid', 'h36m_vid']
-  PARTITION: [0.5, 0.5]
+  LIST: ['3dpw_vid']
+  PARTITION: [1]
   SEQ_LEN: 16
   TEST: 'emdb_1'
 
@@ -21,7 +22,8 @@ LOSS:
 TRAIN:
   RESUME: 'data/pretrain/vimo_checkpoint.pth.tar'
   LOAD_LATEST: True
-  BATCH_SIZE: 16
+  IS_FINETUNE: False
+  BATCH_SIZE: 4
   MULTI_LR: True
   LR: 1e-5
   LR2: 3e-5
@@ -50,8 +52,8 @@ MODEL:
   MOTION_NLAYER: 6
 
 
-EXP_NAME: 'tram_0'
+EXP_NAME: 'fine_5'
 COMMENT:
-  'Default configs.'
+  'return vimo'
 
 

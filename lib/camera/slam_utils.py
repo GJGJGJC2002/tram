@@ -151,3 +151,34 @@ def eval_slam(traj_est, cam_t, cam_q, return_traj=True, correct_scale=False, ali
         return stats, traj_ref, traj_est
     
     return stats
+
+def eval_slam(traj_est, cam_t, cam_q, return_traj=True, correct_scale=False, align=True, align_origin=False):
+    """ Evaluation for SLAM """
+    tstamps = np.array([i for i in range(len(traj_est))], dtype=np.float32)
+
+    traj_est = PoseTrajectory3D(
+        positions_xyz=traj_est[:,:3], 
+        orientations_quat_wxyz=traj_est[:,3:],
+        timestamps=tstamps)
+
+    traj_ref = PoseTrajectory3D(
+        positions_xyz=cam_t.copy(),
+        orientations_quat_wxyz=cam_q.copy(),
+        timestamps=tstamps)
+
+    traj_ref, traj_est = sync.associate_trajectories(traj_ref, traj_est)
+    
+    
+    result = main_ape.ape(traj_ref, traj_est, est_name='traj', 
+        pose_relation=PoseRelation.translation_part, align=align, align_origin=align_origin,
+        correct_scale=correct_scale)
+    
+    #print("result", result)
+    stats = result.stats
+
+
+
+    if return_traj:
+        return stats, traj_ref, traj_est
+    
+    return stats

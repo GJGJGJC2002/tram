@@ -70,6 +70,7 @@ You can also download our saved results [here](https://drive.google.com/drive/fo
 ```bash
 # Evaluation only 
 python scripts/emdb/run_eval.py --split 2 --input_dir "results/emdb"
+python scripts/emdb/run_eval.py --split 2 --input_dir "/home/gejunchen/Work/2025-2/Dataset/emdb1_tram"
 ```
 
 

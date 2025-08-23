@@ -69,7 +69,6 @@ class HMR_VIMO(nn.Module):
         img_focal = batch['img_focal']
         img_center = batch['img_center']
         bn = len(image)
-
         # estimate focal length, and bbox
         bbox_info = self.bbox_est(center, scale, img_focal, img_center)
 
@@ -81,8 +80,7 @@ class HMR_VIMO(nn.Module):
         # space-time module
         if self.st_module is not None:
             bb = einops.repeat(bbox_info, 'b c -> b c h w', h=16, w=12)
-            feature = torch.cat([feature, bb], dim=1)
-
+            feature = torch.cat([feature, bb], dim=1) #torch.Size([128, 1283, 16, 12]) batch = 8, t = 16
             feature = einops.rearrange(feature, '(b t) c h w -> (b h w) t c', t=16)
             feature = self.st_module(feature)
             feature = einops.rearrange(feature, '(b h w) t c -> (b t) c h w', h=16, w=12)
@@ -100,13 +98,6 @@ class HMR_VIMO(nn.Module):
             pred_pose = self.motion_module(pred_pose)
             pred_pose = einops.rearrange(pred_pose, 'b t c -> (b t) c')
 
-        # Predictions
-        rotmat_preds  = [] 
-        shape_preds = []
-        cam_preds   = []
-        j3d_preds = []
-        j2d_preds = []
-
         out = {}
         out['pred_cam'] = pred_cam
         out['pred_pose'] = pred_pose
@@ -114,16 +105,27 @@ class HMR_VIMO(nn.Module):
         out['pred_rotmat'] = rot6d_to_rotmat(out['pred_pose']).reshape(-1, 24, 3, 3)
         out['pred_rotmat_0'] = pred_rotmat_0
         
+        pred_poses = []
+        rotmat_preds  = []
+        rotmat_preds_0 = [] 
+        shape_preds = []
+        cam_preds   = []
+        j3d_preds = []
+        j2d_preds = []
+        
         s_out = self.smpl.query(out)
         j3d = s_out.joints
         j2d = self.project(j3d, out['pred_cam'], center, scale, img_focal, img_center)
 
+        pred_poses.append(out['pred_pose'].clone())
         rotmat_preds.append(out['pred_rotmat'].clone())
+        rotmat_preds_0.append(out['pred_rotmat_0'].clone())
         shape_preds.append(out['pred_shape'].clone())
         cam_preds.append(out['pred_cam'].clone())
         j3d_preds.append(j3d.clone())
         j2d_preds.append(j2d.clone())
-        iter_preds = [rotmat_preds, shape_preds, cam_preds, j3d_preds, j2d_preds]
+        iter_preds = [pred_poses, rotmat_preds, rotmat_preds_0, shape_preds, cam_preds, j3d_preds, j2d_preds]
+
 
         trans_full = self.get_trans(out['pred_cam'], center, scale, img_focal, img_center)
         out['trans_full'] = trans_full
@@ -337,3 +339,220 @@ class HMR_VIMO(nn.Module):
 
         return
 
+class SceneHMR(HMR_VIMO):
+    def __init__(self, cfg=None, device='cpu', **kwargs):
+        super(SceneHMR, self).__init__(cfg=cfg, device=device, **kwargs)
+        print("SceneHMR model initialized")
+    
+    def forward(self, batch, **kwargs):
+        prepre_img, pre_img, img  = batch['img_prepre'], batch['img_pre'], batch['img_cur']
+        center = batch['center']
+        scale  = batch['scale']
+        img_focal = batch['img_focal'] #原图片的焦距
+        img_center = batch['img_center'] #原图片的中心点
+
+        #print(center.shape, scale.shape, img_focal.shape, img_center.shape)
+        center = einops.repeat(center, 'b c  -> b t c', t=3).reshape(-1, 2)
+        scale = einops.repeat(scale, 'b  -> b t ', t=3).reshape(-1)
+        img_focal = einops.repeat(img_focal, 'b -> b t ', t=3).reshape(-1)
+        img_center = einops.repeat(img_center, 'b c -> b t c', t=3).reshape(-1, 2)
+        
+        image = torch.stack([img, pre_img, prepre_img], dim=1) #torch.Size([batch*seq, 3, 3, 256, 256])
+        image = image.reshape(-1, 3, 256, 256)
+        
+        bbox_info = self.bbox_est(center, scale, img_focal, img_center) 
+
+        # backbone
+        with autocast('cuda'):
+            feature = self.backbone(image[:,:,:,32:-32]) #torch.Size([b*seq*3, 1283, 16, 12])
+            feature = feature.float()
+
+        # space-time module
+        if self.st_module is not None:
+            # bbox_info = einops.repeat(bbox_info, 'b c -> b t c', t=3)
+            # bbox_info = bbox_info.reshape(-1, 3)
+            bb = einops.repeat(bbox_info, 'b c -> b c h w', h=16, w=12) #torch.Size([b*seq*3, 3, 16, 12])
+
+            feature = torch.cat([feature, bb], dim=1)
+
+            feature = einops.rearrange(feature, '(b t) c h w -> (b h w) t c', t=3)
+            feature = self.st_module(feature)
+            feature = einops.rearrange(feature, '(b h w) t c -> (b t) c h w', h=16, w=12)
+
+        # smpl_head: transformer + smpl
+        pred_pose, pred_shape, pred_cam = self.smpl_head(feature)
+
+        #smpl motion module
+        if self.motion_module is not None :
+            bb = einops.rearrange(bbox_info, '(b t) c -> b t c', t=3)
+            pred_pose = einops.rearrange(pred_pose, '(b t) c -> b t c', t=3) #[b*seq, 3, 144]
+            pred_shape = einops.rearrange(pred_shape, '(b t) c -> b t c', t=3)
+            pred_cam = einops.rearrange(pred_cam, '(b t) c -> b t c', t=3)
+            pred_pose = torch.cat([pred_pose, bb], dim=2)
+            pred_pose = self.motion_module(pred_pose)
+            # pred_pose = pred_pose[:, :1, :] #取出第一个时间步的pose
+            # pred_shape = pred_shape[:, :1, :]
+            # pred_cam = pred_cam[:, :1, :]
+            pred_pose = einops.rearrange(pred_pose, 'b t c -> (b t) c')
+            pred_shape = einops.rearrange(pred_shape, 'b t c -> (b t) c')
+            pred_cam = einops.rearrange(pred_cam, 'b t c -> (b t) c')
+
+        # Predictions
+        pred_poses = []
+        rotmat_preds  = []
+        rotmat_preds_0 = [] 
+        shape_preds = []
+        cam_preds   = []
+        j3d_preds = []
+        j2d_preds = []
+
+        
+        out = {}
+        out['pred_cam'] = pred_cam
+        out['pred_pose'] = pred_pose
+        out['pred_shape'] = pred_shape
+        out['pred_rotmat'] = rot6d_to_rotmat(out['pred_pose']).reshape(-1, 24, 3, 3)
+        out['pred_rotmat_0'] = out['pred_rotmat']
+
+        s_out = self.smpl.query(out)
+        j3d = s_out.joints
+        j2d = self.project(j3d, out['pred_cam'], center, scale, img_focal, img_center)
+        trans_full = self.get_trans(out['pred_cam'], center, scale, img_focal, img_center)
+
+        for i in range(3):
+            pred_poses.append(out['pred_pose'][i::3].clone())
+            rotmat_preds.append(out['pred_rotmat'][i::3].clone())
+            rotmat_preds_0.append(out['pred_rotmat_0'][i::3].clone())
+            shape_preds.append(out['pred_shape'][i::3].clone())
+            cam_preds.append(out['pred_cam'][i::3].clone())
+            j3d_preds.append(j3d[i::3].clone())
+            j2d_preds.append(j2d[i::3].clone())
+        
+        iter_preds = [pred_poses, rotmat_preds, rotmat_preds_0, shape_preds, cam_preds, j3d_preds, j2d_preds, img, pre_img, prepre_img]
+
+        out['pred_cam'] = cam_preds[0] 
+        out['pred_pose'] = pred_poses[0]
+        out['pred_shape'] = shape_preds[0]
+        out['pred_rotmat'] = rotmat_preds[0]
+        out['pred_rotmat_0'] = rotmat_preds_0[0]
+        out['trans_full'] = trans_full[::3]
+        
+        return out, iter_preds
+
+class SceneHMR_2(HMR_VIMO):
+    def __init__(self, cfg=None, device='cpu', **kwargs):
+        super(SceneHMR_2, self).__init__(cfg=cfg, device=device, **kwargs)
+        if cfg.MODEL.MOTION_MODULE:
+            hdim = cfg.MODEL.MOTION_HDIM
+            nlayer = cfg.MODEL.MOTION_NLAYER
+            self.motion_module = temporal_attention(in_dim=144*2+3, 
+                                                    out_dim=144,
+                                                    hdim=hdim,
+                                                    nlayer=nlayer,
+                                                    residual=True)
+        else:
+            self.motion_module = None
+        print("SceneHMR model initialized")
+    
+    def forward(self, batch, **kwargs):
+        image  = batch['warp_img']
+        center = batch['center']
+        scale  = batch['scale']
+        img_focal = batch['img_focal'] #原图片的焦距
+        img_center = batch['img_center'] #原图片的中心点
+        bn = len(image)
+        image = image.to(torch.float32) #没有做cropcrop操作
+
+        if 1:
+            prepre_img = image[:, :, :, :256] 
+            pre_img = image[:, :, :, 256:512]
+            img = image[:, :, :, 512:768]
+            image = torch.stack([img, pre_img, prepre_img], dim=1) #torch.Size([batch*seq, 3, 3, 256, 256])
+            image = image.reshape(-1, 3, 256, 256)
+        
+        bbox_info = self.bbox_est(center, scale, img_focal, img_center) 
+
+        # backbone
+        with autocast('cuda'):
+            feature = self.backbone(image[:,:,:,32:-32]) #torch.Size([b*seq*3, 1283, 16, 12])
+            feature = feature.float()
+
+        # space-time module
+        if self.st_module is not None:
+            bbox_info = einops.repeat(bbox_info, 'b c -> b t c', t=3)
+            bbox_info = bbox_info.reshape(-1, 3)
+            bb = einops.repeat(bbox_info, 'b c -> b c h w', h=16, w=12) #torch.Size([b*seq*3, 3, 16, 12])
+
+            feature = torch.cat([feature, bb], dim=1)
+
+            feature = einops.rearrange(feature, '(b t) c h w -> (b h w) t c', t=3)
+            feature = self.st_module(feature)
+            feature = einops.rearrange(feature, '(b h w) t c -> (b t) c h w', h=16, w=12)
+
+        # smpl_head: transformer + smpl
+        pred_pose, pred_shape, pred_cam = self.smpl_head(feature)
+
+        # smpl motion module
+        if self.motion_module is not None:
+            bb = einops.rearrange(bbox_info, '(b t) c -> b t c', t=3)
+            pred_pose = einops.rearrange(pred_pose, '(b t) c -> b t c', t=3) #[b*seq, 3, 144]
+            pred_pose_0 = pred_pose[:, 0, :]
+            pred_rotmat_0 = rot6d_to_rotmat(pred_pose_0).reshape(-1, 24, 3, 3)
+            pred_shape = einops.rearrange(pred_shape, '(b t) c -> b t c', t=3)
+            pred_cam = einops.rearrange(pred_cam, '(b t) c -> b t c', t=3)
+
+
+            vimo_pose = einops.repeat(batch['vimo_pose'], 'b c -> b t c', t=3) #torch.Size([b*seq*3, 144])
+            vimo_pose = vimo_pose.reshape(-1, 144)
+            vimo_pose = einops.rearrange(vimo_pose, '(b t) c -> b t c', t=3) #难搞到指定位置的
+            pred_pose = torch.cat([pred_pose, vimo_pose, bb], dim=2) #(b, t, c=144*2+3)
+
+            pred_pose = self.motion_module(pred_pose)
+            pred_pose = pred_pose[:, :1, :] #取出第一个时间步的pose
+            pred_shape = pred_shape[:, :1, :]
+            pred_cam = pred_cam[:, :1, :]
+            pred_pose = einops.rearrange(pred_pose, 'b t c -> (b t) c')
+            pred_shape = einops.rearrange(pred_shape, 'b t c -> (b t) c')
+            pred_cam = einops.rearrange(pred_cam, 'b t c -> (b t) c')
+
+        # Predictions
+        pred_poses = []
+        rotmat_preds  = []
+        rotmat_preds_0 = [] 
+        shape_preds = []
+        cam_preds   = []
+        j3d_preds = []
+        j2d_preds = []
+
+        
+        out = {}
+        out['pred_cam'] = pred_cam + batch['vimo_cam']
+        out['pred_pose'] = pred_pose + batch['vimo_pose']
+        out['pred_shape'] = pred_shape + batch['vimo_betas']
+        out['pred_rotmat'] = rot6d_to_rotmat(out['pred_pose']).reshape(-1, 24, 3, 3)
+        out['pred_rotmat_0'] = out['pred_rotmat']
+        
+        #debug
+        # out['pred_cam'] = batch['vimo_cam']
+        # out['pred_pose'] = batch['vimo_pose']
+        # out['pred_shape'] = batch['vimo_betas']
+        # out['pred_rotmat'] = rot6d_to_rotmat(out['pred_pose']).reshape(-1, 24, 3, 3)
+        # out['pred_rotmat_0'] = pred_rotmat_0
+
+        s_out = self.smpl.query(out)
+        j3d = s_out.joints
+        j2d = self.project(j3d, out['pred_cam'], center, scale, img_focal, img_center)
+
+        pred_poses.append(out['pred_pose'].clone())
+        rotmat_preds.append(out['pred_rotmat'].clone())
+        rotmat_preds_0.append(out['pred_rotmat_0'].clone())
+        shape_preds.append(out['pred_shape'].clone())
+        cam_preds.append(out['pred_cam'].clone())
+        j3d_preds.append(j3d.clone())
+        j2d_preds.append(j2d.clone())
+        iter_preds = [pred_poses, rotmat_preds, rotmat_preds_0, shape_preds, cam_preds, j3d_preds, j2d_preds]
+
+        trans_full = self.get_trans(out['pred_cam'], center, scale, img_focal, img_center)
+        out['trans_full'] = trans_full
+        
+        return out, iter_preds

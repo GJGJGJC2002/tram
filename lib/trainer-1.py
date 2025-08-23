@@ -3,38 +3,9 @@ import logging
 from tqdm import tqdm
 from lib.core.base_trainer import BaseTrainer
 from lib.utils.pose_utils import Evaluator
-import matplotlib.pyplot as plt
+
 logger = logging.getLogger(__name__)
 
-import matplotlib.pyplot as plt
-import torchvision.transforms.functional as F
-import torch
-
-def visualize_img_j2d(img_tensor, j2d_tensor, idx=0, save_path=None):
-    """
-    img_tensor: (B, 3, H, W), values in [0, 1] or [0, 255]
-    j2d_tensor: (B, 49, 2), 2D joint predictions
-    idx: 可视化第几张图
-    """
-    img = img_tensor[idx].detach().cpu()
-    j2d = j2d_tensor[idx].detach().cpu()
-
-    # 如果是 [0, 255]，转成 [0, 1]
-    if img.max() > 1:
-        img = img / 255.0
-
-    img = F.to_pil_image(img)
-    
-    plt.figure(figsize=(6, 6))
-    plt.imshow(img)
-    plt.scatter(j2d[:, 0], j2d[:, 1], s=20, c='r', marker='x')
-    plt.title(f"Image {idx} with predicted 2D joints")
-    plt.axis('off')
-    
-    if save_path:
-        plt.savefig(save_path, bbox_inches='tight')
-        #print(f"Saved visualization to {save_path}")
-    plt.close()
 
 class Trainer(BaseTrainer):
 
@@ -42,17 +13,14 @@ class Trainer(BaseTrainer):
         return
 
     def train_one_epoch(self, ):
-        if not self.train_scene:    
-            self.model.train()
-            self.model.freeze_modules()
-        else:
-            self.model.eval()
-            self.SceneModel.train()
-            self.SceneModel.freeze_modules()
-
+        # self.model.train()
+        # self.model.freeze_modules()
+        self.model.eval()
+        self.SceneModel.train()
+        self.SceneModel.freeze_modules()
         update_iter = self.cfg.TRAIN.UPDATE_ITER
         crop_size = self.model.crop_size
-        Loss_arr = []
+
 
         for i, batch in enumerate(tqdm(self.train_loader, desc="Computing batch")):
 
@@ -61,69 +29,52 @@ class Trainer(BaseTrainer):
             batch = {k: v.to(self.device).flatten(0, 1) for k, v in batch.items() if type(v)==torch.Tensor}
             batch['beta_weight'] = self.cfg.TRAIN.SMPL_BETA
             batch['smpl'] = self.model.smpl
+            out, iter_preds = self.model(batch, iters=update_iter)
             
-            if False:
-                out, iter_preds = self.model(batch, iters=update_iter)
-                pose_preds, rotmat_preds, rotmat_preds_0, shape_preds, cam_preds, j3d_preds, j2d_preds = iter_preds
-                #print(batch["pred_camera"].shape) #torch.Size([64, 4, 4])
-                N = len(rotmat_preds)
-                gamma = self.cfg.TRAIN.GAMMA
-                for j in range(N):
-                    batch['pred_pose'] = pose_preds[j]
-                    batch['pred_rotmat'] = rotmat_preds[j]
-                    batch['pred_rotmat_0'] = rotmat_preds_0[j]
-                    batch['pred_betas'] = shape_preds[j]
-                    batch['pred_cam'] = cam_preds[j]
-                    batch['pred_keypoints_3d'] = j3d_preds[j]
-                    batch['pred_keypoints_2d'] = (j2d_preds[j]-crop_size/2.) / (crop_size/2.) 
+            try:
+                batch['pred_rotmat_0'] = out['pred_rotmat_0']
+            except Exception:
+                batch['pred_rotmat_0'] = None
 
-                batch['vimo_pose'] = out['pred_pose'].detach()
-                batch['vimo_betas'] = out['pred_shape'].detach()
-                batch['vimo_cam'] = out['pred_cam'].detach()
+            # Loss on full sequence
+            pose_preds, rotmat_preds, shape_preds, cam_preds, j3d_preds, j2d_preds = iter_preds
             
-            if self.train_scene:
-                out, iter_preds = self.SceneModel(batch, iters=update_iter)
-                pose_preds, rotmat_preds, rotmat_preds_0, shape_preds, cam_preds, j3d_preds, j2d_preds, img, pre_img, pre_pre_img = iter_preds
-                
-                N = len(rotmat_preds)
-                gamma = self.cfg.TRAIN.GAMMA
-                for j in range(1):
-                    batch['pred_pose'] = pose_preds[j]
-                    batch['pred_rotmat'] = rotmat_preds[j]
-                    batch['pred_rotmat_0'] = rotmat_preds_0[j]
-                    batch['pred_betas'] = shape_preds[j]
-                    batch['pred_cam'] = cam_preds[j]
-                    batch['pred_keypoints_3d'] = j3d_preds[j]
-                    batch['pred_keypoints_2d'] = (j2d_preds[j]-crop_size/2.) / (crop_size/2.) 
 
-                #print(j3d_preds[0].shape, j2d_preds[0].shape) #torch.Size([64, 49, 3]) torch.Size([64, 49, 2])
-                if i%50==0:
-                    GT_j2d = batch['keypoints']*((crop_size/2.))+crop_size/2.
-                    #print("GT_j2d", GT_j2d.shape) #torch.Size([64, 49, 2])
-                    visualize_img_j2d(batch['img'], GT_j2d, 0, self.logdir + '/intern.png')
-                    visualize_img_j2d(img, j2d_preds[0], 0, self.logdir + '/intern_pred.png')
-                    visualize_img_j2d(pre_img, j2d_preds[1], 0, self.logdir + '/intern_pred_pre.png')
-                    visualize_img_j2d(pre_pre_img, j2d_preds[2], 0, self.logdir + '/intern_pred_prepre.png')
-
+            
+            for j in range(N):
+                batch['pred_pose'] = pose_preds[j]
+                batch['pred_rotmat'] = rotmat_preds[j]
+                batch['pred_betas'] = shape_preds[j]
+                batch['pred_cam'] = cam_preds[j]
+                batch['pred_keypoints_3d'] = j3d_preds[j]
+                batch['pred_keypoints_2d'] = (j2d_preds[j]-crop_size/2.) / (crop_size/2.) 
+            
+            out, iter_preds = self.SceneModel(batch, iters=update_iter)
+            
+            N = len(rotmat_preds)
+            gamma = self.cfg.TRAIN.GAMMA
+            for j in range(N):
+                batch['pred_pose'] = pose_preds[j]
+                batch['pred_rotmat'] = rotmat_preds[j]
+                batch['pred_betas'] = shape_preds[j]
+                batch['pred_cam'] = cam_preds[j]
+                batch['pred_keypoints_3d'] = j3d_preds[j]
+                batch['pred_keypoints_2d'] = (j2d_preds[j]-crop_size/2.) / (crop_size/2.) 
+            
             loss = 0
             for j in range(N):
                 loss_j, losses = self.criterion(batch)
                 loss += gamma**(N-j-1) * loss_j
                 
             loss *= self.cfg.TRAIN.LOSS_SCALE
-            #tqdm_postfix = {"loss": f"{loss.item():.4f}"}
-            #tqdm.write(f"Batch {i}: Loss = {loss.item():.4f}")
-            #self.train_loader.set_postfix(tqdm_postfix)
+
             # Backprop
             self.optimizer.zero_grad()
             loss.backward()
             
             if self.cfg.TRAIN.CLIP_GRADIENT == True:
                 self.clip_gradient_norm(self.model, max_norm=self.cfg.TRAIN.CLIP_NORM)
-                self.clip_gradient_norm(self.SceneModel, max_norm=self.cfg.TRAIN.CLIP_NORM)
-            
-            #tqdm.write(f"Batch {i}: Loss = {loss.item():.4f}")
-            Loss_arr.append(loss.item())
+
             self.optimizer.step()
             
             self.global_step += 1
@@ -135,7 +86,7 @@ class Trainer(BaseTrainer):
             if self.should_break():
                 break
 
-        return Loss_arr
+        return 
         
 
     def check_and_validate(self, batch_id):
@@ -171,9 +122,7 @@ class Trainer(BaseTrainer):
         torch.cuda.empty_cache() 
 
         self.model.eval()
-        self.model.freeze_modules()
         self.SceneModel.eval()
-        self.SceneModel.freeze_modules()
         update_iter = self.cfg.TRAIN.UPDATE_ITER
 
         model = self.model
@@ -196,11 +145,7 @@ class Trainer(BaseTrainer):
             # prediction
             with torch.no_grad():
                 out, _ = model(batch, iters=update_iter)
-                if self.train_scene:
-                    batch['vimo_pose'] = out['pred_pose'].detach()
-                    batch['vimo_betas'] = out['pred_shape'].detach()
-                    batch['vimo_cam'] = out['pred_cam'].detach()
-                    out, _ = scenemodel(batch, iters=update_iter)
+                out, _ = scenemodel(batch, iters=update_iter)
 
                 if '3dpw' in db.dataset:
                     mode = '3dpw'
@@ -233,23 +178,15 @@ class Trainer(BaseTrainer):
         logger.info(f"Epoch {self.epoch}, Step {self.global_step}, validation mpjpe: {mpjpe}")
         logger.info(f"Epoch {self.epoch}, Step {self.global_step}, validation accel: {acc}")
 
-        self.mpjpe_arr.append(mpjpe.item())
-        #清空plt画布
-        plt.clf()
-        plt.plot(self.mpjpe_arr)
-        plt.savefig(self.logdir + '/mpjpe.png')
         self.writer.add_scalar(f"Validation/RE", re, self.global_step)
         self.writer.add_scalar(f"Validation/MPJPE", mpjpe, self.global_step)
         self.writer.add_scalar(f"Validation/ACCEL", acc, self.global_step)
         self.writer.flush()
 
-        if self.train_scene:
-            self.SceneModel.train()
-            self.SceneModel.freeze_modules()
-        else:
-            self.model.train()
-            self.model.freeze_modules()
-
+        #self.model.train()
+        self.SceneModel.train()
+        #self.model.freeze_modules()
+        self.SceneModel.freeze_modules()
         self.performance_type = 'min'
 
         torch.cuda.empty_cache() 

@@ -50,34 +50,38 @@ def main(cfg):
     checkpoint = cfg.MODEL.CHECKPOINT
     state_dict = torch.load(checkpoint, map_location=cfg.DEVICE, weights_only=False)
     #released_ckpt = torch.load(cfg.MODEL.RELEASE, map_location=cfg.DEVICE, weights_only=True)
-    _ = SceneModel.load_state_dict(state_dict['state_dict'], strict=False)
+    _ = model.load_state_dict(state_dict['state_dict'], strict=False) #为啥这个可以直接加载hmr2.0的参数？
+    
+    # print("Loaded params:", set(state_dict['state_dict'].keys()))  #smpl_head和backbone的参数
+    # print("Model params:", set(model.state_dict().keys())) #st_motion
     
     model = model.to(cfg.DEVICE)
     ScneneModel = SceneModel.to(cfg.DEVICE)
 
-    model.frozen_modules = [model.backbone, model.st_module, model.motion_module, model.smpl_head]
+    model.frozen_modules = [model.backbone]
     model.freeze_modules()
     SceneModel.frozen_modules = [SceneModel.backbone]
     SceneModel.freeze_modules()
 
-
+    logger.info(f'Loaded pretrained checkpoint {checkpoint}') #加载hmr2.0
+    logger.info(f'Freeze pretrained backbone')
 
     if cfg.TRAIN.MULTI_LR:
-        params = [{'params': [p for p in SceneModel.smpl_head.parameters() if p.requires_grad]}]
+        params = [{'params': [p for p in model.smpl_head.parameters() if p.requires_grad]}]
 
         if cfg.MODEL.MOTION_MODULE:
-            params.append({'params': [p for p in SceneModel.motion_module.parameters() if p.requires_grad],
+            params.append({'params': [p for p in model.motion_module.parameters() if p.requires_grad],
                            'lr':cfg.TRAIN.LR2})
             
         if cfg.MODEL.ST_MODULE:
-            params.append({'params': [p for p in SceneModel.st_module.parameters() if p.requires_grad], 
+            params.append({'params': [p for p in model.st_module.parameters() if p.requires_grad], 
                            'lr':cfg.TRAIN.LR2})
         
         optimizer = torch.optim.AdamW(params, lr=cfg.TRAIN.LR, weight_decay=cfg.TRAIN.WD)
         
         logger.info(f'Using multiple learning rates:[{cfg.TRAIN.LR}, {cfg.TRAIN.LR2}] and WD: {cfg.TRAIN.WD}')
     else:
-        optimizer = torch.optim.AdamW(params=[p for p in SceneModel.parameters() if p.requires_grad], 
+        optimizer = torch.optim.AdamW(params=[p for p in model.parameters() if p.requires_grad], 
                                     lr=cfg.TRAIN.LR, weight_decay=cfg.TRAIN.WD)
 
 
@@ -91,6 +95,7 @@ def main(cfg):
         writer=writer,
         SceneModel=SceneModel,
         lr_scheduler=None,
+        train_scene=False
     ).train()
 
 

@@ -4,23 +4,24 @@ import logging
 from tqdm import tqdm
 import numpy as np
 import os.path as osp
-
+import matplotlib.pyplot as plt
 logger = logging.getLogger(__name__)
 
 
 class BaseTrainer():
     def __init__(
             self, cfg, data_loaders,
-            model, criterion, optimizer,
-            lr_scheduler=None, writer=None
+            model, criterion, optimizer, SceneModel=None,
+            lr_scheduler=None, writer=None, train_scene=True
         ):
 
         # Base trainer
         self.cfg = cfg
         self.device = cfg.DEVICE
         self.train_loader, self.test_loader = data_loaders
-
+        self.train_scene = train_scene
         self.model = model
+        self.SceneModel = SceneModel
         self.criterion = criterion
         self.optimizer = optimizer
         self.writer = writer
@@ -47,6 +48,8 @@ class BaseTrainer():
         # Load Checkpoint if provided or latest available (by cfg)
         self.load_checkpoint()
 
+        self.mpjpe_arr = []
+
 
     def train_one_epoch(self):
         raise NotImplementedError('You need to provide a train_one_epoch method')
@@ -59,12 +62,18 @@ class BaseTrainer():
         return
 
     def train(self):
-        _ = self.validate()
-
+        #_ = self.validate()
+        Loss_arr = []
         for epoch in range(self.start_epoch, self.end_epoch):
             self.epoch = epoch
-            self.train_one_epoch()
-
+            loss = self.train_one_epoch()
+            #拼接两个列表
+            Loss_arr += loss
+            plt.clf()
+            #输出折线图
+            plt.plot(Loss_arr)
+            #保存图片
+            plt.savefig(self.logdir + '/loss.png')
             self.train_loader.re_init()
 
             if self.should_break():
@@ -79,7 +88,7 @@ class BaseTrainer():
             'epoch': epoch,
             'batch': batch,
             'global_step': self.global_step,
-            'model': self.model.state_dict(),
+            'model': self.SceneModel.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'lr_scheduler': self.lr_scheduler.state_dict(),
             'dataperm': self.train_loader.sampler.dataset_perm,
@@ -97,24 +106,30 @@ class BaseTrainer():
 
 
     def load_checkpoint(self):
+        vimo_check_path = None
+        is_finetune = self.cfg.TRAIN.IS_FINETUNE
         if self.cfg.TRAIN.RESUME is not None:
-            check_path = self.cfg.TRAIN.RESUME
-            is_finetune = self.cfg.TRAIN.IS_FINETUNE
-            self.resume(check_path, is_finetune)
+            vimo_check_path = self.cfg.TRAIN.RESUME
 
-        elif self.cfg.TRAIN.LOAD_LATEST:
+        if self.cfg.TRAIN.LOAD_LATEST:
             check_path = self.logdir + '/checkpoint.pth.tar'
-            self.resume(check_path)
+            self.resume(check_path, is_finetune,  vimo_check_path=vimo_check_path)
 
         else:
             logger.info('Starting from scratch.')
 
 
-    def resume(self, check_path, is_finetune=False):
-        if osp.isfile(check_path):
-            checkpoint = torch.load(check_path)
-            self.model.load_state_dict(checkpoint['model'], strict=False)
+    def resume(self, check_path, is_finetune=False, vimo_check_path=None):
+        if vimo_check_path is not None:
+            checkpoint = torch.load(vimo_check_path, map_location=self.device)
+            logger.info(f"=> Loaded vimo checkpoint '{vimo_check_path}'. ")
+            if self.train_scene:
+                print("loading vimo checkpoint")
+                self.model.load_state_dict(checkpoint['model'], strict=False)
+            self.SceneModel.load_state_dict(checkpoint['model'], strict=False)
 
+        if osp.isfile(check_path) and self.train_scene:
+            checkpoint = torch.load(check_path)
             logger.info(f"=> Loaded checkpoint '{check_path}'. ")
 
             if not is_finetune:
@@ -125,6 +140,7 @@ class BaseTrainer():
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
                 self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
                 self.train_loader.load_checkpoint(checkpoint['batch'], checkpoint['dataperm'])
+                self.SceneModel.load_state_dict(checkpoint['model'], strict=False)
 
                 performance = checkpoint['performance']
                 logger.info(f"=> Loaded previous optimizer/dataset schedule.")

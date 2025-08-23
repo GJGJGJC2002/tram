@@ -33,14 +33,14 @@ class VideoDataset(Dataset):
     """
 
     def __init__(self, dataset, ignore_3d=False, use_augmentation=True, is_train=True,
-                normalization=False, cropped=False, crop_size=224, seqlen=16, stride=16, subset=True):
+                normalization=False, cropped=False, crop_size=224, seqlen=16, stride=16, subset=True, need_warp=False):
         super(VideoDataset, self).__init__()
         
         self.is_train = is_train
-
+        self.need_warp = need_warp
         self.dataset = dataset
         self.data = np.load(config.DATASET_FILES[is_train][dataset])
-
+        self.extra_data = np.load(config.EXTRA_DATASET_FILES[is_train][dataset])
         self.img_dir = config.DATASET_FOLDERS[dataset]
         self.imgname = self.data['imgname'].astype(np.string_)
         self.normalization = normalization
@@ -69,27 +69,36 @@ class VideoDataset(Dataset):
             self.img_focal = self.data['img_focal']
             self.img_center = self.data['img_center']
             self.has_camcalib = True
+
             print(dataset, 'has camera intrinsics')
         except KeyError:
             self.has_camcalib = False
 
         # Get camera intrinsic, if available
-        try:    
+        try:
+                
             self.orig_shape = self.data['orig_shape']
             print(dataset, 'has original image shape')
         except KeyError:
             self.orig_shape = None
 
         # Get camera extrinsic, if available
-        try:    
-            self.cam_R = self.data['cam_R']
-            self.cam_t = self.data['cam_t']
-            self.trans = self.data['trans']
+        try:
+            self.camera = self.extra_data['camera']
+            self.w2c_camera = self.extra_data['w2c_camera']
             self.has_extrinsic = True
             print(dataset, 'has camera extrinsic')
         except KeyError:
             self.has_extrinsic = False
         
+        # Get GT camera, if available
+        try:
+            self.gt_camera = self.extra_data['GT_camera']
+            self.gt_w2c_camera = self.extra_data['gt_w2c_camera']
+            print(dataset, 'has GT camera')
+        except KeyError:
+            self.gt_camera = None
+            self.gt_w2c_camera = None        
         # Get gt SMPL parameters, if available
         try:
             self.pose = self.data['pose'].astype(float)
@@ -108,6 +117,7 @@ class VideoDataset(Dataset):
         try:
             self.pose_3d = self.data['S']
             self.has_pose_3d = 1
+            #print(self.pose_3d[0]) #和我的一致，看看pose_3d做了哪些处理
             print(dataset, 'has pose_3d')
         except KeyError:
             self.has_pose_3d = 0
@@ -153,8 +163,9 @@ class VideoDataset(Dataset):
         self.stride = stride
 
         if 'coco' not in self.dataset:
+            
             self.seq_idx, self.group = self.split_into_chunks(self.seqname, seqlen, stride=stride)
-
+            print(f'Found {len(self.seq_idx)} sequences in {self.dataset}.') #Found 1347 16 sequences in 3dpw_vid.
             if (not is_train) and subset:
                 np.random.seed(0)
                 self.seq_idx = np.random.permutation(self.seq_idx)
@@ -162,7 +173,7 @@ class VideoDataset(Dataset):
                 print(f'Using a subset of {self.dataset}')
 
             seqs = []
-            for seq in self.seq_idx:
+            for seq in self.seq_idx: #(N, 2)-->(N, seq)
                 seqs.append(list(range(seq[0], seq[1]+1)))
             self.seq_idx = seqs
         else:
@@ -178,6 +189,10 @@ class VideoDataset(Dataset):
                     'emdb_1':  f'{ROOT}/emdb/crops_1',
                     '3dpw_vid_test': f'{ROOT}/3dpw/crops_test'}
         
+        if self.need_warp:
+            warp_cropdirs = {'3dpw_vid': f'{ROOT}/3dpw/warped', 'emdb_1': f'{ROOT}/emdb/warped_1'}
+            self.warp_dir = warp_cropdirs[self.dataset]
+
         self.crop_dir = cropdirs[self.dataset]
         self.crop_files = sorted(glob(f'{self.crop_dir}/*.jpg'))
 
@@ -224,7 +239,7 @@ class VideoDataset(Dataset):
                         [self.crop_size, self.crop_size], rot=rot)
         else:
             center = [128, 128]
-            scale = 256/200 * sc
+            scale = 256/200 * sc #?
             rgb_img = crop_crop(rgb_img, center, scale, 
                         [self.crop_size, self.crop_size], rot=rot)
             
@@ -345,7 +360,7 @@ class VideoDataset(Dataset):
     def __getitem__(self, index):
         augs = self.augm_params()
        
-        indices = self.seq_idx[index]
+        indices = self.seq_idx[index] #取出一个序列
         items = []
         for idx in indices:
             item = self.get_frame(idx, augs)
@@ -361,7 +376,7 @@ class VideoDataset(Dataset):
         scale = self.scale[index].copy()
         center = self.center[index].copy()
 
-        # Get augmentation parameters
+        # Get augmentation parameters 数据增强
         flip, pn, rot, sc, occ = augs
         _, _, _, _, occ = self.augm_params()
         
@@ -375,11 +390,26 @@ class VideoDataset(Dataset):
             # cropfile = self.crop_files[index]
             crop_dir = self.crop_dir
             cropfile = f'{crop_dir}/{index:08d}.jpg'
+            if self.need_warp:
+                warp_cropdirs = self.warp_dir
+                warp_cropdirs = f'{warp_cropdirs}/{index:08d}.jpg'
+                #print("loading", warp_cropdirs)
             try:
                 img = cv2.imread(cropfile)[:,:,::-1].copy().astype(float)
+                if self.need_warp:
+                    warp_img = cv2.imread(warp_cropdirs)[:,:,::-1].copy().astype(float)
+                    cur_img = warp_img[:, 512:, :]
+                    pre_img = warp_img[:, 256:512, :]
+                    prepre_img = warp_img[:, :256, :]
+                    warp_bags = [prepre_img, pre_img, cur_img]
+                    #print("warp_bags", warp_bags[0].shape, warp_bags[1].shape, warp_bags[2].shape)
+                    #print("warp_img", warp_img.shape)
             except Exception:
                 print(f'Cropfile unavailable: {cropfile}')
                 img = np.zeros([256, 256, 3]).astype(float)
+                cur_img = np.zeros([256, 256, 3]).astype(float)
+                prepre_img = np.zeros([256, 256, 3]).astype(float)
+                pre_img = np.zeros([256, 256, 3]).astype(float)
         else:
             img = cv2.imread(imgname)[:,:,::-1].copy().astype(float)
 
@@ -405,19 +435,30 @@ class VideoDataset(Dataset):
             pose = torch.zeros(72).float()
             betas = torch.zeros(10).float()
 
-        # Process image
+        #Process image
+
         try:    
             img = self.rgb_processing(img, center, sc*scale, rot, flip, pn, occ, sc)
+            if self.need_warp:
+                warp_bags = [self.rgb_processing(bag, center, sc*scale, rot, flip, pn, occ, sc) for bag in warp_bags]
         except:
             img = np.zeros([self.crop_size, self.crop_size, 3])
 
         if self.normalization:
             img = self.normalize_img(img)
+            if self.need_warp:
+                warp_bags = [self.normalize_img(bag) for bag in warp_bags]
         else:
             img = torch.from_numpy(img)
+            if self.need_warp:
+                warp_img = torch.from_numpy(warp_img)
 
         # Store unnormalize image
         item['img'] = img
+        if self.need_warp:
+            item['img_cur'] = warp_bags[2]
+            item['img_pre'] = warp_bags[1]
+            item['img_prepre'] = warp_bags[0]
         item['pose'] = torch.from_numpy(self.pose_processing(pose, rot, flip)).float()
         item['betas'] = torch.from_numpy(betas).float()
 
@@ -425,8 +466,10 @@ class VideoDataset(Dataset):
         if self.has_pose_3d:
             S = self.pose_3d[index].copy()
             item['pose_3d'] = torch.from_numpy(self.j3d_processing(S, rot, flip)).float()
+            
         else:
             item['pose_3d'] = torch.zeros(24,4, dtype=torch.float32)
+
 
         # Get SMPL 3D joints for evaluation
         if self.is_train == False:
@@ -444,6 +487,12 @@ class VideoDataset(Dataset):
         # Apply augmentation transforms to bbox center
         center = self.center_processing(center, rot, flip, orig_shape)
         
+        item['pred_camera'] = torch.from_numpy(self.camera[index].copy())
+        item['pred_w2c_camera'] = torch.from_numpy(self.w2c_camera[index].copy())
+        
+        if self.is_train:
+            item['gt_camera'] = torch.from_numpy(self.gt_camera[index].copy())
+            item['gt_w2c_camera'] = torch.from_numpy(self.gt_w2c_camera[index].copy())
         
         item['scale'] = torch.tensor(sc * scale).float()
         item['center'] = torch.from_numpy(center).float()
@@ -451,7 +500,8 @@ class VideoDataset(Dataset):
         item['img_center'] = torch.from_numpy(item['img_center']).float()
         item['has_smpl'] = torch.tensor(self.has_smpl[index]).long()
         item['has_pose_3d'] = torch.tensor(self.has_pose_3d).long()
-    
+        
+        
         return item
 
 
@@ -472,11 +522,14 @@ class VideoDataset(Dataset):
 
 
     def split_into_chunks(self, vid_names, seqlen, stride):
+        print('Splitting into chunks')
+        #print(vid_names) #seq_names 是有非常多的重复的,这是一个二键值的数组,要验证分出来的小序列是在一个视频里
         video_names, group = np.unique(vid_names, return_index=True)
         perm = np.argsort(group)
-        video_names, group = video_names[perm], group[perm]
+        video_names, group = video_names[perm], group[perm] #去重和排序
 
         indices = np.split(np.arange(0, vid_names.shape[0]), group[1:])
+        #print(indices) #(N, length) N 为视频的数量, length 为每个视频的长度
         if '3dpw' in self.dataset:
             invalid = self.detect_invalid_section()
         elif 'emdb' in self.dataset:
@@ -487,12 +540,12 @@ class VideoDataset(Dataset):
             invalid = self.data['invalid']
             self.invalid = invalid
         else:
-            invalid = np.zeros(len(self.imgname))
+            invalid = np.zeros(len(self.imgname)) # bool (N)
 
         video_start_end_indices = []
 
-        for idx in range(len(video_names)):
-            indexes = indices[idx]
+        for idx in range(len(video_names)): 
+            indexes = indices[idx] #枚举每一个视频
             if indexes.shape[0] < seqlen:
                 continue
 
@@ -502,11 +555,13 @@ class VideoDataset(Dataset):
                 indexes_invalid = invalid[group[idx]:group[idx+1]]
 
             chunks = view_as_windows(indexes, (seqlen,), step=stride)
+            #print("video length", indexes.shape[0]) # length*seqlen == N
+            #print(chunks.shape) # (length, seqlen) length为序列数量 序列是不重复的
             chunks_invalid = view_as_windows(indexes_invalid, (seqlen,), step=stride)
             
-            chunks_valid = chunks[chunks_invalid.sum(axis=-1)==0]
+            chunks_valid = chunks[chunks_invalid.sum(axis=-1)==0] #去除不合法的序列 (length, seqlen) = int 图像数组的index
             
-            start_finish = chunks_valid[:, (0, -1)].tolist()
+            start_finish = chunks_valid[:, (0, -1)].tolist() # (length, 2) 取出每个序列的开始和结束的index
             video_start_end_indices += start_finish
 
         return video_start_end_indices, group
