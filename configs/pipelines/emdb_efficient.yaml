@@ -1,0 +1,40 @@
+# EMDB Efficient Pipeline Configuration
+# 快速模式：使用 efficient SMPL 估计
+
+name: "EMDB Efficient Pipeline"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/emdb_efficient"
+
+components:
+  - type: detection
+    name: detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+
+  - type: segmentation
+    name: segmentation
+    backend: sam
+
+  - type: slam
+    name: slam
+    backend: droid
+    use_masks: true
+    align_to_world: true
+
+  - type: hpe
+    name: hpe
+    backend: vimo
+    mode: efficient  # Faster but slightly less accurate
+    use_mean_shape: true
+
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - w_mpjpe
+      - ate
+
+

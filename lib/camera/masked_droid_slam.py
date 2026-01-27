@@ -16,7 +16,12 @@ from .slam_utils import get_dimention, est_calib, image_stream, preprocess_masks
 from .est_scale import est_scale_hybrid
 from ..utils.rotation_conversions import quaternion_to_matrix
 
-torch.multiprocessing.set_start_method('spawn')
+# 设置 multiprocessing start method，如果已经设置过则跳过
+try:
+    torch.multiprocessing.set_start_method('spawn')
+except RuntimeError:
+    # Context 已经被设置，使用当前的 context
+    pass
 
 
 def run_metric_slam(img_folder, masks=None, calib=None, is_static=False):

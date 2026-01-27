@@ -1,0 +1,60 @@
+# EMDB Iterative Pipeline Configuration
+# 迭代优化 Pipeline：相机估计 -> 人体估计 -> 重投影 -> 相机优化
+
+name: "EMDB Iterative Pipeline"
+mode: "iterative"
+device: "cuda"
+output_dir: "results/emdb_iterative"
+
+# Iterative settings
+max_iterations: 3
+convergence_threshold: 0.001
+convergence_metric: "reprojection_error"
+
+# Save intermediate results
+save_intermediate: true
+
+components:
+  # Stage 1: Initial Detection and Segmentation
+  - type: detection
+    name: detection
+    backend: vitdet
+    threshold: 0.5
+
+  - type: segmentation
+    name: segmentation
+    backend: sam
+
+  # Stage 2: Camera Estimation
+  - type: slam
+    name: camera_estimation
+    backend: droid
+    use_masks: true
+    align_to_world: true
+
+  # Stage 3: Human Pose Estimation
+  - type: hpe
+    name: hpe_estimation
+    backend: vimo
+    mode: accurate
+    use_mean_shape: true
+
+  # Stage 4: Evaluation (computes reprojection_error for convergence check)
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - w_mpjpe
+      - ate
+
+# Optional hooks for debugging/visualization
+# hooks:
+#   - stage: "after_camera_estimation"
+#     function: "lib.pipeline.hooks.visualize_camera_trajectory"
+#   - stage: "after_hpe_estimation"
+#     function: "lib.pipeline.hooks.visualize_smpl"
+#   - stage: "on_iteration_end"
+#     function: "lib.pipeline.hooks.log_iteration_metrics"
+
+

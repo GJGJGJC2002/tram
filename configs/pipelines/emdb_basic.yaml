@@ -1,0 +1,58 @@
+# EMDB Basic Pipeline Configuration
+# 基础的两阶段 Pipeline：相机估计 -> 人体估计
+
+name: "EMDB Basic Pipeline"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/emdb"
+
+# Save intermediate results for debugging
+save_intermediate: false
+
+components:
+  # 1. Human Detection
+  - type: detection
+    name: human_detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+    max_detections: 10
+    arrange_mode: size
+
+  # 2. Human Segmentation (for SLAM masking)
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+
+  # 3. Camera Motion Estimation (SLAM)
+  - type: slam
+    name: camera_estimation
+    backend: droid
+    use_masks: true
+    align_to_world: true
+
+  # 4. Human Pose Estimation
+  - type: hpe
+    name: smpl_estimation
+    backend: vimo
+    mode: accurate  # 'accurate' or 'efficient'
+    use_mean_shape: true
+
+  # 5. Evaluation
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
+    chunk_length: 100
+    fps: 30
+
+
