@@ -60,7 +60,6 @@ class Pipeline:
         # 配置
         self.device = self.config.get('device', 'cuda')
         self.output_dir = self.config.get('output_dir', 'results')
-        self.save_intermediate = self.config.get('save_intermediate', False)
     
     def add_component(self, component: Component) -> 'Pipeline':
         """
@@ -120,7 +119,8 @@ class Pipeline:
         if stage not in self.hooks:
             self.hooks[stage] = []
         self.hooks[stage].append(hook_fn)
-        self.logger.debug(f"Added hook at stage '{stage}': {hook_fn.__name__}")
+        hook_name = getattr(hook_fn, '__name__', repr(hook_fn))
+        self.logger.debug(f"Added hook at stage '{stage}': {hook_name}")
         return self
     
     def remove_hooks(self, stage: str):
@@ -132,26 +132,25 @@ class Pipeline:
         """执行指定阶段的所有 Hook"""
         hooks = self.hooks.get(stage, [])
         for hook_fn in hooks:
+            
             try:
                 hook_fn(data)
             except Exception as e:
-                self.logger.warning(f"Hook '{hook_fn.__name__}' at stage '{stage}' failed: {e}")
+                hook_name = getattr(hook_fn, '__name__', repr(hook_fn))
+                self.logger.warning(f"Hook '{hook_name}' at stage '{stage}' failed: {e}")
                 # Hook 失败不影响主流程
     
     # === 生命周期管理 ===
     
     def setup(self):
-        """初始化所有组件"""
+        """初始化 Pipeline（延迟初始化组件）"""
         self.logger.info(f"Setting up Pipeline '{self.name}' with {len(self.components)} components...")
-        
-        start_time = time.time()
-        
-        for component in self.components:
-            component.ensure_setup()
-        
+
+        # 注意：组件将在第一次执行时延迟初始化（lazy setup）
+        # 这样可以跳过被 cache 的组件，避免不必要的模型加载
+
         self._is_setup = True
-        elapsed = time.time() - start_time
-        self.logger.info(f"Pipeline setup completed in {elapsed:.2f}s")
+        self.logger.info(f"Pipeline setup completed (components will be initialized on-demand)")
     
     def cleanup(self):
         """清理所有组件资源"""
@@ -190,25 +189,47 @@ class Pipeline:
         data.metadata['execution_start'] = datetime.now().isoformat()
         
         try:
+            # 获取缓存目录
+            cache_dir = self._get_cache_dir(data)
+
             for i, component in enumerate(self.components):
                 # 检查是否应该停止
                 if data.should_stop:
                     self.logger.info(f"Pipeline stopped early at component {component.name}")
                     break
-                
+
+                # 获取组件的缓存配置
+                cache_config = component.config.get('cache', {})
+                cache_enabled = cache_config.get('enabled', False)
+                use_cache = cache_config.get('use_cache', cache_enabled)
+                overwrite = cache_config.get('overwrite', False)
+
+                # 检查缓存是否存在且可以使用
+                cache_loaded = False
+                if use_cache and not overwrite:
+                    if self._cache_exists(cache_dir, component.name, data.iteration):
+                        cached_data = self._load_intermediate(cache_dir, component.name, data.iteration)
+                        if cached_data is not None:
+                            # 从缓存加载数据，保留原始输入数据（如images、annotations等）
+                            data = self._merge_cached_data(data, cached_data)
+                            cache_loaded = True
+                            self.logger.info(f"[{i+1}/{len(self.components)}] Loaded {component.name} from cache")
+
                 # 执行前 Hook
                 self._run_hooks(f"before_{component.name}", data)
-                
-                # 执行组件
-                self.logger.info(f"[{i+1}/{len(self.components)}] Running {component.name}...")
-                data = component(data)
-                
+
+                # 如果没有加载缓存，则执行组件
+                if not cache_loaded:
+                    # 执行组件
+                    self.logger.info(f"[{i+1}/{len(self.components)}] Running {component.name}...")
+                    data = component(data)
+
+                    # 保存中间结果
+                    if cache_enabled:
+                        self._save_intermediate(data, component.name)
+
                 # 执行后 Hook
                 self._run_hooks(f"after_{component.name}", data)
-                
-                # 保存中间结果
-                if self.save_intermediate:
-                    self._save_intermediate(data, component.name)
             
             # 完成 Hook
             self._run_hooks("on_complete", data)
@@ -227,17 +248,91 @@ class Pipeline:
         
         return data
     
-    def _save_intermediate(self, data: PipelineData, stage_name: str):
-        """保存中间结果"""
-        intermediate_dir = os.path.join(
-            self.output_dir, 
-            'intermediate', 
+    def _merge_cached_data(self, original_data: PipelineData, cached_data: PipelineData) -> PipelineData:
+        """
+        合并原始数据和缓存数据
+
+        保留原始输入数据（images、annotations等），同时加载缓存的处理结果。
+
+        Args:
+            original_data: 原始数据（包含输入）
+            cached_data: 缓存的数据（包含处理结果）
+
+        Returns:
+            合并后的数据
+        """
+        # 创建原始数据的副本
+        merged = original_data.clone()
+
+        # 从缓存加载处理结果
+        # 注意：不覆盖输入数据（images、annotations等）
+        fields_to_load = [
+            'bboxes', 'masks', 'tracks',
+            'camera_params', 'gt_camera_params',
+            'smpl_params', 'gt_smpl_params',
+            'metrics', 'current_stage'
+        ]
+
+        for field in fields_to_load:
+            if hasattr(cached_data, field):
+                value = getattr(cached_data, field)
+                if value is not None:
+                    setattr(merged, field, value)
+
+        # 合并 metadata
+        merged.metadata.update(cached_data.metadata)
+        merged.metadata['cache_loaded'] = True
+        merged.metadata['cache_loaded_at'] = datetime.now().isoformat()
+
+        return merged
+
+    def _get_cache_dir(self, data: PipelineData) -> str:
+        """获取缓存目录路径"""
+        return os.path.join(
+            self.output_dir,
+            'intermediate',
             data.sequence_name or 'unnamed'
         )
-        os.makedirs(intermediate_dir, exist_ok=True)
-        
+
+    def _get_cache_path(self, cache_dir: str, stage_name: str, iteration: int) -> str:
+        """获取缓存文件路径"""
+        prefix = f"iter{iteration}_{stage_name}"
+        return os.path.join(cache_dir, f"{prefix}_data.pkl")
+
+    def _cache_exists(self, cache_dir: str, stage_name: str, iteration: int) -> bool:
+        """检查缓存是否存在"""
+        cache_path = self._get_cache_path(cache_dir, stage_name, iteration)
+        return os.path.exists(cache_path)
+
+    def _load_intermediate(self, cache_dir: str, stage_name: str, iteration: int) -> Optional[PipelineData]:
+        """加载中间结果"""
+        cache_path = self._get_cache_path(cache_dir, stage_name, iteration)
+
+        if not os.path.exists(cache_path):
+            return None
+
+        self.logger.info(f"Loading cached results for '{stage_name}' from {cache_path}")
+        try:
+            data = PipelineData.load(cache_path)
+            self.logger.info(f"Successfully loaded cached results for '{stage_name}'")
+            return data
+        except Exception as e:
+            self.logger.warning(f"Failed to load cache for '{stage_name}': {e}")
+            return None
+
+    def _save_intermediate(self, data: PipelineData, stage_name: str):
+        """保存中间结果"""
+        cache_dir = self._get_cache_dir(data)
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # 保存完整的数据对象
+        cache_path = self._get_cache_path(cache_dir, stage_name, data.iteration)
+        data.save(cache_path)
+        self.logger.info(f"Saved intermediate results for '{stage_name}' to {cache_path}")
+
+        # 同时保存各个独立的文件（保持向后兼容）
         prefix = f"iter{data.iteration}_{stage_name}"
-        data.save_results(intermediate_dir, prefix)
+        data.save_results(cache_dir, prefix)
     
     def __call__(self, data: PipelineData) -> PipelineData:
         """允许直接调用 Pipeline"""

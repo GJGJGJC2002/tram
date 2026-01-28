@@ -101,7 +101,7 @@ def compute_bbox_from_points(X, img_w, img_h, scaleFactor=1.2):
 
 
 class Renderer():
-    def __init__(self, width, height, focal_length, device, faces=None, 
+    def __init__(self, width, height, focal_length, device, faces=None,
                  bin_size=None, max_faces_per_bin=None):
 
         self.width = width
@@ -114,8 +114,17 @@ class Renderer():
                 (faces).astype('int')
             ).unsqueeze(0).to(self.device)
 
+        # 保存渲染器参数
+        self.bin_size = bin_size
+        self.max_faces_per_bin = max_faces_per_bin
+
         self.initialize_camera_params()
         self.lights = PointLights(device=device, location=[[0.0, 0.0, -10.0]])
+
+        # 注意：create_renderer 需要在 initialize_camera_params 之后调用
+        # 因为它需要 self.image_sizes
+        # 但此时 image_sizes 还没初始化，所以先设置默认值
+        self.image_sizes = torch.tensor([[height, width]]).to(device)
         self.create_renderer(bin_size, max_faces_per_bin)
 
     def create_renderer(self, bin_size, max_faces_per_bin):
@@ -213,7 +222,7 @@ class Renderer():
 
         self.K_full, self.image_sizes = update_intrinsics_from_bbox(self.K, bbox)
         self.cameras = self.create_camera()
-        self.create_renderer()
+        self.create_renderer(self.bin_size, self.max_faces_per_bin)
 
     def reset_bbox(self,):
         bbox = torch.zeros((1, 4)).float().to(self.device)
@@ -223,7 +232,7 @@ class Renderer():
 
         self.K_full, self.image_sizes = update_intrinsics_from_bbox(self.K, bbox)
         self.cameras = self.create_camera()
-        self.create_renderer()
+        self.create_renderer(self.bin_size, self.max_faces_per_bin)
 
     def render_mesh(self, vertices, background, colors=[0.8, 0.8, 0.8]):
         self.update_bbox(vertices[::50], scale=1.2)

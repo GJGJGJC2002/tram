@@ -18,11 +18,19 @@ components:
     min_size: 100
     max_detections: 10
     arrange_mode: size
+    cache:
+      enabled: true      # 启用缓存，保存检测结果
+      use_cache: true    # 使用缓存，如果存在则跳过执行
+      overwrite: false   # 不覆盖已有缓存（设为true强制重新执行）
 
   # 2. Human Segmentation (for SLAM masking)
   - type: segmentation
     name: human_segmentation
     backend: sam
+    cache:
+      enabled: true     # 不缓存（依赖于detection结果）
+      use_cache: true
+      overwrite: false
 
   # 3. Camera Motion Estimation (SLAM)
   - type: slam
@@ -30,6 +38,10 @@ components:
     backend: droid
     use_masks: true
     align_to_world: true
+    cache:
+      enabled: true      # 启用缓存，SLAM通常很慢
+      use_cache: true
+      overwrite: false
 
   # 4. Human Pose Estimation
   - type: hpe
@@ -37,6 +49,8 @@ components:
     backend: vimo
     mode: accurate  # 'accurate' or 'efficient'
     use_mean_shape: true
+    frame_stride: 1   # 跳帧步长，1=不跳帧，20=每20帧取一次
+    max_frames: 80     # 最大处理帧数，null=全部
 
   # 5. Evaluation
   - type: evaluation
@@ -55,4 +69,11 @@ components:
     chunk_length: 100
     fps: 30
 
-
+# Hooks configuration
+hooks:
+  # SMPL mesh visualization (every 20 frames)
+  - stage: 'after_smpl_estimation'
+    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+    enabled: True
+    params:
+      interval: 20

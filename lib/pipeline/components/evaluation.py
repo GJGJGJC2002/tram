@@ -128,53 +128,75 @@ class EvaluationComponent(Component):
         # 保存结果
         data.metrics = metrics
         
-        self.logger.info("Evaluation results:")
-        for k, v in metrics.items():
-            self.logger.info(f"  {k}: {v:.4f}")
+        # self.logger.info("Evaluation results:")
+        # for k, v in metrics.items():
+        #     self.logger.info(f"  {k}: {v:.4f}")
         
         return data
     
     def _load_gt_data(self, data: PipelineData) -> Dict[str, Any]:
         """加载 GT 数据"""
         from lib.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle
-        
+
         ann = data.annotations
-        
+
+        # 检查是否有帧采样信息
+        sampling_info = data.metadata.get('frame_sampling')
+        if sampling_info:
+            sampled_indices = np.array(sampling_info['sampled_indices'])
+            self.logger.info(
+                f"Applying frame sampling to GT: {len(ann['smpl']['poses_body'])} -> {len(sampled_indices)} frames"
+            )
+        else:
+            sampled_indices = None
+
         gender = ann['gender']
         poses_body = ann["smpl"]["poses_body"]
         poses_root = ann["smpl"]["poses_root"]
         betas = np.repeat(
-            ann["smpl"]["betas"].reshape((1, -1)), 
-            repeats=ann["n_frames"], 
+            ann["smpl"]["betas"].reshape((1, -1)),
+            repeats=ann["n_frames"],
             axis=0
         )
         trans = ann["smpl"]["trans"]
         ext = ann['camera']['extrinsics']
-        
+
+        # 应用采样
+        if sampled_indices is not None:
+            poses_body = poses_body[sampled_indices]
+            poses_root = poses_root[sampled_indices]
+            betas = betas[sampled_indices]
+            trans = trans[sampled_indices]
+            ext = ext[sampled_indices]
+
         tt = lambda x: torch.from_numpy(x).float()
-        
+
         # 世界坐标系下的 GT
         gt = self._smpls[gender](
-            body_pose=tt(poses_body), 
-            global_orient=tt(poses_root), 
-            betas=tt(betas), 
+            body_pose=tt(poses_body),
+            global_orient=tt(poses_root),
+            betas=tt(betas),
             transl=tt(trans),
-            pose2rot=True, 
+            pose2rot=True,
             default_smpl=True
         )
-        
+
         # 相机坐标系下的 GT
         poses_root_cam = matrix_to_axis_angle(
             tt(ext[:, :3, :3]) @ axis_angle_to_matrix(tt(poses_root))
         )
         gt_cam = self._smpls[gender](
-            body_pose=tt(poses_body), 
-            global_orient=poses_root_cam, 
+            body_pose=tt(poses_body),
+            global_orient=poses_root_cam,
             betas=tt(betas),
-            pose2rot=True, 
+            pose2rot=True,
             default_smpl=True
         )
-        
+
+        valid_mask = ann.get('good_frames_mask')
+        if sampled_indices is not None and valid_mask is not None:
+            valid_mask = valid_mask[sampled_indices]
+
         return {
             'gender': gender,
             'gt_j3d': gt.joints[:, :24],
@@ -183,7 +205,7 @@ class EvaluationComponent(Component):
             'gt_j3d_cam': gt_cam.joints[:, :24],
             'gt_vert_cam': gt_cam.vertices,
             'ext': ext,
-            'valid_mask': ann.get('good_frames_mask'),
+            'valid_mask': valid_mask,
         }
     
     def _compute_pred_smpl(self, data: PipelineData) -> Dict[str, Any]:

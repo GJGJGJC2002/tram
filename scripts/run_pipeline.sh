@@ -23,13 +23,15 @@ echo "使用配置: $CONFIG"
 echo "处理序列: $PERSON/$SEQ"
 
 # 运行 Pipeline
-python scripts/run_pipeline.py \
+python lib/scripts/run_pipeline.py \
     --config $CONFIG \
     --seq $SEQ \
     --person $PERSON \
     --split $SPLIT \
     --dataset_path $DATASET_PATH \
     --output_dir $OUTPUT_DIR \
-    --device cuda
+    --device cuda \
+    --debug \
+    --visualize
 
 echo "Pipeline 执行完成！"

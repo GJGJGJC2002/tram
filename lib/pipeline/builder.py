@@ -148,15 +148,28 @@ class PipelineBuilder:
         """添加 hook 到 pipeline"""
         stage = hook_config.get('stage')
         function_path = hook_config.get('function')
-        
+        enabled = hook_config.get('enabled', True)
+        params = hook_config.get('params', {})
+
         if not stage or not function_path:
             logger.warning(f"Invalid hook config: {hook_config}")
             return
-        
+
+        if not enabled:
+            logger.info(f"Hook {function_path} is disabled, skipping")
+            return
+
         try:
             # 动态导入 hook 函数
             hook_fn = cls._import_function(function_path)
+
+            # 如果有参数，创建偏函数
+            if params:
+                import functools
+                hook_fn = functools.partial(hook_fn, **params)
+
             pipeline.add_hook(stage, hook_fn)
+            logger.info(f"Added hook: {function_path} at stage '{stage}'")
         except Exception as e:
             logger.warning(f"Failed to add hook {function_path}: {e}")
     

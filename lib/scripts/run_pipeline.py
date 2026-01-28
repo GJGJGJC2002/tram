@@ -17,7 +17,8 @@ Usage:
 
 import sys
 import os
-sys.path.insert(0, os.path.dirname(__file__) + '/..')
+# 文件位于 lib/scripts/，需要将项目根目录加入 sys.path
+sys.path.insert(0, os.path.dirname(__file__) + '/../..')
 
 import argparse
 import logging
@@ -25,6 +26,58 @@ import pickle as pkl
 from glob import glob
 from datetime import datetime
 from collections import defaultdict
+
+
+class ColoredFormatter(logging.Formatter):
+    """带颜色的日志格式化器"""
+
+    # ANSI 颜色代码
+    COLORS = {
+        'RESET': '\033[0m',
+        'BOLD': '\033[1m',
+        'BLUE': '\033[34m',
+        'CYAN': '\033[36m',
+        'GREEN': '\033[32m',
+        'YELLOW': '\033[33m',
+        'RED': '\033[31m',
+        'MAGENTA': '\033[35m',
+    }
+
+    def __init__(self, fmt=None, datefmt=None, style='%'):
+        super().__init__(fmt, datefmt, style)
+
+    def format(self, record):
+        # 只对终端输出添加颜色
+        if hasattr(record, 'levelname'):
+            levelname = record.levelname
+            if levelname == 'INFO':
+                level_color = self.COLORS['GREEN']
+            elif levelname == 'WARNING':
+                level_color = self.COLORS['YELLOW']
+            elif levelname == 'ERROR':
+                level_color = self.COLORS['RED']
+            elif levelname == 'DEBUG':
+                level_color = self.COLORS['CYAN']
+            else:
+                level_color = self.COLORS['RESET']
+            record.levelname = f"{level_color}{levelname}{self.COLORS['RESET']}"
+
+        # 格式化消息
+        message = super().format(record)
+
+        # 为文件名和行号添加颜色和加粗
+        # 匹配格式: [filename.py:lineno]
+        import re
+        pattern = r'\[([^\]]+\.py:\d+)\]'
+        replacement = f"[{self.COLORS['BOLD']}{self.COLORS['BLUE']}\\1{self.COLORS['RESET']}]"
+        message = re.sub(pattern, replacement, message)
+
+        return message
+
+
+class PlainFormatter(logging.Formatter):
+    """文件日志格式化器（无颜色）"""
+    pass
 
 import numpy as np
 import pandas as pd
@@ -41,15 +94,25 @@ def setup_logging(output_dir: str):
     """设置日志系统"""
     os.makedirs(output_dir, exist_ok=True)
     log_file = os.path.join(output_dir, 'pipeline.log')
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
+
+    # 创建根 logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()  # 清除已有的 handlers
+
+    # 日志格式
+    log_format = '%(asctime)s - %(name)s [%(filename)s:%(lineno)d] - %(levelname)s - %(message)s'
+
+    # 文件 handler（无颜色）
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setFormatter(PlainFormatter(log_format))
+    logger.addHandler(file_handler)
+
+    # 终端 handler（带颜色）
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(ColoredFormatter(log_format))
+    logger.addHandler(console_handler)
+
     return logging.getLogger(__name__)
 
 
@@ -136,9 +199,7 @@ def main():
     # Pipeline 配置
     parser.add_argument('--config', type=str, default=None,
                        help='Path to pipeline config file (YAML)')
-    parser.add_argument('--preset', type=str, default='basic',
-                       choices=['basic', 'efficient', 'iterative', 'evaluation'],
-                       help='Use preset pipeline configuration')
+
     
     # 数据集参数
     parser.add_argument('--seq', type=str, default=None,
@@ -167,8 +228,6 @@ def main():
                        help='Enable debug hooks')
     parser.add_argument('--visualize', action='store_true',
                        help='Enable visualization hooks')
-    parser.add_argument('--save_intermediate', action='store_true',
-                       help='Save intermediate results')
     
     args = parser.parse_args()
     
@@ -185,32 +244,15 @@ def main():
         logger.info(f"Loading pipeline from config: {args.config}")
         pipeline = PipelineBuilder.from_config(args.config)
     else:
-        logger.info(f"Creating {args.preset} pipeline preset")
-        
-        if args.preset == 'basic':
-            pipeline = PipelineBuilder.create_basic_pipeline(
-                name="emdb_basic",
-                device=args.device,
-                output_dir=args.output_dir
-            )
-        elif args.preset == 'efficient':
-            pipeline = PipelineBuilder.from_config(
-                'configs/pipelines/emdb_efficient.yaml'
-            )
-        elif args.preset == 'iterative':
-            pipeline = PipelineBuilder.from_config(
-                'configs/pipelines/emdb_iterative.yaml'
-            )
-        else:  # evaluation
-            pipeline = PipelineBuilder.create_evaluation_pipeline(
-                name="emdb_eval",
-                device=args.device,
-                output_dir=args.output_dir
-            )
+        logger.info(f"Creating Evaluation pipline")
+        pipeline = PipelineBuilder.create_evaluation_pipeline(
+            name="emdb_eval",
+            device=args.device,
+            output_dir=args.output_dir
+        )
     
     # 配置更新
     pipeline.config['output_dir'] = args.output_dir
-    pipeline.config['save_intermediate'] = args.save_intermediate
     
     # 添加调试 hooks
     if args.debug:

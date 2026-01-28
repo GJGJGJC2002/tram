@@ -1,7 +1,8 @@
 """SegmentationComponent - 图像分割组件"""
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 import numpy as np
+import cv2
 import torch
 from tqdm import tqdm
 
@@ -41,12 +42,18 @@ class SegmentationComponent(BackendComponent):
     def execute(self, data: PipelineData) -> PipelineData:
         """
         执行分割
-        
+
         为每一帧图像生成人体 mask，结果存储在 data.masks 中。
         """
-        images = data.images
+        # 获取图像（如果未加载则从路径加载）
+        if data.images is not None:
+            images = data.images
+        else:
+            images = self._load_images(data.image_paths)
+            data.images = images
+
         bboxes = data.bboxes  # [N, K, 5]
-        
+
         num_frames = len(images)
         masks = []
         
@@ -76,7 +83,17 @@ class SegmentationComponent(BackendComponent):
         }
         
         self.logger.info(f"Segmentation completed, mask coverage: {masked_pixels/total_pixels*100:.2f}%")
-        
+
         return data
+
+    def _load_images(self, image_paths: List[str]) -> np.ndarray:
+        """加载图像"""
+        images = []
+        for path in image_paths:
+            img = cv2.imread(path)
+            if img is None:
+                raise ValueError(f"Failed to load image: {path}")
+            images.append(img)
+        return np.array(images)
 
 

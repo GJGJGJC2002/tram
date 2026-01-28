@@ -35,6 +35,7 @@ for root in roots:
     annfile = f'{root}/{root.split("/")[-2]}_{root.split("/")[-1]}_data.pkl'
     ann = pkl.load(open(annfile, 'rb'))
     if ann[f'emdb{spl}']:
+        print("Adding root: ", root)
         emdb.append(root)
 
 # SMPL

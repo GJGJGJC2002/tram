@@ -18,10 +18,10 @@ logger = logging.getLogger(__name__)
 
 def log_stage_info(data: PipelineData):
     """记录阶段信息"""
-    logger.info(f"Stage: {data.current_stage}, Iteration: {data.iteration}")
-    if data.metrics:
-        for k, v in data.metrics.items():
-            logger.info(f"  {k}: {v:.4f}")
+    # logger.info(f"Stage: {data.current_stage}, Iteration: {data.iteration}")
+    # if data.metrics:
+    #     for k, v in data.metrics.items():
+    #         logger.info(f"  {k}: {v:.4f}")
 
 
 def log_iteration_metrics(data: PipelineData):
@@ -228,6 +228,197 @@ def visualize_camera_trajectory(data: PipelineData):
     logger.info(f"Camera trajectory visualization saved to {vis_dir}")
 
 
+def visualize_smpl_mesh(data: PipelineData, interval: int = None):
+    """
+    每隔 N 帧将估计的 SMPL mesh 投影到图片上并保存
+
+    Args:
+        data: Pipeline 数据容器
+        interval: 可视化间隔（帧数），如果为 None 则从 metadata 读取
+    """
+    # 从 metadata 获取间隔，如果没有则使用默认值 100
+    if interval is None:
+        interval = data.metadata.get('smpl_vis_interval', 100)
+    try:
+        import cv2
+        import torch
+        from glob import glob
+    except ImportError:
+        logger.warning("Visualization requires cv2, torch, glob")
+        return
+
+    # 检查必要数据
+    if data.smpl_params is None:
+        logger.info("No SMPL parameters to visualize")
+        return
+
+    if len(data.image_paths) == 0:
+        logger.info("No image paths available")
+        return
+
+    # 获取输出目录
+    output_dir = data.metadata.get('output_dir', 'results')
+    vis_dir = os.path.join(output_dir, 'visualization', 'smpl_mesh')
+    os.makedirs(vis_dir, exist_ok=True)
+
+    # 延迟导入（避免启动时加载）
+    try:
+        from lib.models.smpl import SMPL
+        from lib.vis.renderer import Renderer
+    except ImportError:
+        logger.warning("SMPL or Renderer not available")
+        return
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 获取 SMPL 模型和 faces
+    smpl_model = SMPL().to(device)
+    faces = smpl_model.faces
+
+    # 获取图像尺寸
+    img_sample = cv2.imread(data.image_paths[0])
+    img_height, img_width = img_sample.shape[:2]
+
+    # 获取相机参数
+    img_focal = 1000.0  # 默认值
+    img_center = None
+
+    # 尝试从 annotations 获取相机参数
+    if data.annotations and 'camera' in data.annotations:
+        intr = data.annotations['camera'].get('intrinsics')
+        if intr is not None:
+            img_focal = (intr[0, 0] + intr[1, 1]) / 2.0
+            img_center = intr[:2, 2]
+
+    # 尝试从 camera_params 获取
+    if data.camera_params and data.camera_params.focal_length:
+        img_focal = data.camera_params.focal_length
+        if data.camera_params.principal_point is not None:
+            img_center = data.camera_params.principal_point
+
+    if img_center is None:
+        img_center = np.array([img_width / 2, img_height / 2])
+
+    # 创建 renderer
+    renderer = Renderer(img_width, img_height, img_focal, device, faces=faces,
+                       bin_size=-1, max_faces_per_bin=30000)
+
+    # 获取 SMPL 参数
+    smpl = data.smpl_params
+
+    # 使用 rotmat 而不是 poses（rotmat 已经是正确的 rotation matrix 格式）
+    if smpl.rotmat is None:
+        logger.warning("SMPL rotmat is None, cannot visualize. Skipping visualization.")
+        return
+
+    poses = smpl.rotmat  # [N, 24, 3, 3] - 已经是 rotation matrix 格式
+    betas = smpl.betas  # [N, 10]
+    trans = smpl.trans  # [N, 3]
+
+    # 转换为 tensor
+    if isinstance(poses, np.ndarray):
+        poses = torch.from_numpy(poses).float()
+    if isinstance(betas, np.ndarray):
+        betas = torch.from_numpy(betas).float()
+    if isinstance(trans, np.ndarray):
+        trans = torch.from_numpy(trans).float()
+
+    poses = poses.to(device)
+    betas = betas.to(device)
+    trans = trans.to(device)
+
+    # 输出调试信息
+    # logger.info(f"[DEBUG] Original SMPL params shapes:")
+    # logger.info(f"  - rotmat: {poses.shape}")
+    # logger.info(f"  - betas: {betas.shape}")
+    # logger.info(f"  - trans: {trans.shape}")
+
+    # logger.info(f"[DEBUG] Rotmat tensor info:")
+    # logger.info(f"  - Shape: {poses.shape}")
+    # logger.info(f"  - Dimensions: {poses.dim()}")
+    # logger.info(f"  - Device: {poses.device}")
+    # logger.info(f"  - Dtype: {poses.dtype}")
+    # logger.info(f"  - Min value: {poses.min().item():.4f}")
+    # logger.info(f"  - Max value: {poses.max().item():.4f}")
+
+    # rotmat 应该已经是 [N, 24, 3, 3] 格式，不需要转换
+    if poses.dim() != 4 or poses.shape[1:] != (24, 3, 3):
+        logger.warning(f"Unexpected rotmat shape: {poses.shape}, expected [N, 24, 3, 3]")
+        return
+
+    logger.info(f"[DEBUG] Rotmat format is correct, no conversion needed!")
+
+    # 每隔 interval 帧可视化一次
+    num_frames = len(data.image_paths)
+    for frame_idx in range(0, num_frames, interval):
+        try:
+            # 加载图像
+            img = cv2.imread(data.image_paths[frame_idx])
+            if img is None:
+                continue
+
+            # 获取当前帧的 SMPL 参数
+            pose = poses[frame_idx:frame_idx+1]  # [1, 24, 3, 3]
+            beta = betas[frame_idx:frame_idx+1] if betas.dim() == 2 else betas  # [1, 10]
+
+            # 处理 trans - 确保形状是 [1, 3] (SMPLx 期望 [batch_size, 3])
+            tran = trans[frame_idx]  # [1, 3]
+            if tran.dim() == 2 and tran.shape[0] == 1:  # [1, 3]
+                pass  # 保持 [1, 3]
+            elif tran.dim() == 1:  # [3]
+                tran = tran.unsqueeze(0)  # -> [1, 3]
+            else:
+                logger.warning(f"Unexpected trans shape: {tran.shape}")
+                tran = tran.view(1, -1)[:, :3]  # 强制变成 [1, 3]
+
+
+            # 分离 global_orient 和 body_pose
+            global_orient = pose[:, [0]]  # [1, 1, 3, 3]
+            body_pose = pose[:, 1:]  # [1, 23, 3, 3]
+
+            # logger.info(f"[DEBUG] Frame {frame_idx} SMPL input shapes:")
+            # logger.info(f"  - global_orient: {global_orient.shape}")
+            # logger.info(f"  - body_pose: {body_pose.shape}")
+            # logger.info(f"  - betas: {beta.shape}")
+            # logger.info(f"  - transl: {tran.shape} (should be [1, 3])")
+
+            # 推理 SMPL
+            with torch.no_grad():
+                smpl_output = smpl_model(
+                    body_pose=body_pose,
+                    global_orient=global_orient,
+                    betas=beta,
+                    transl=tran,  # 应该是 [3]
+                    pose2rot=False,
+                    default_smpl=True  # 使用标准 SMPL 输出，避免额外的关节计算
+                )
+
+            # logger.info(f"[DEBUG] SMPL output shapes:")
+            # logger.info(f"  - vertices: {smpl_output.vertices.shape}")
+            # logger.info(f"  - joints: {smpl_output.joints.shape if hasattr(smpl_output, 'joints') else 'N/A'}")
+
+            vertices = smpl_output.vertices[0]  # [6890, 3] - 在 GPU 上
+
+            # 渲染（vertices 保持在 GPU 上，与 renderer 的设备一致）
+            rendered_img = renderer.render_mesh(
+                vertices,  # GPU tensor
+                img.copy(),
+                colors=[0.5, 0.8, 0.5]  # 绿色
+            )
+
+            # 保存
+            output_path = os.path.join(vis_dir, f'frame_{frame_idx:04d}.jpg')
+            cv2.imwrite(output_path, rendered_img)
+
+        except Exception as e:
+            logger.warning(f"Failed to visualize frame {frame_idx}: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+            continue
+
+    logger.info(f"SMPL mesh visualization saved to {vis_dir} (every {interval} frames)")
+
+
 # === 早停 Hooks ===
 
 def early_stopping_on_error(data: PipelineData):
@@ -277,6 +468,7 @@ DEBUG_HOOKS = {
 VISUALIZATION_HOOKS = {
     'after_detection': [visualize_detection],
     'after_slam': [visualize_camera_trajectory],
+    'after_hpe': [visualize_smpl_mesh],
 }
 
 # 监控 hooks
