@@ -28,6 +28,10 @@ components:
     backend: vimo
     mode: efficient  # Faster but slightly less accurate
     use_mean_shape: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
 
   - type: evaluation
     name: evaluation

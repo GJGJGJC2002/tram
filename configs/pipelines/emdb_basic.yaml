@@ -50,7 +50,11 @@ components:
     mode: accurate  # 'accurate' or 'efficient'
     use_mean_shape: true
     frame_stride: 1   # 跳帧步长，1=不跳帧，20=每20帧取一次
-    max_frames: 80     # 最大处理帧数，null=全部
+    max_frames: null     # 最大处理帧数，null=全部
+    cache:
+      enabled: true      # 启用缓存，保存 SMPL 估计结果
+      use_cache: true    # 使用缓存，如果存在则跳过执行
+      overwrite: false   # 不覆盖已有缓存（设为true强制重新执行）
 
   # 5. Evaluation
   - type: evaluation

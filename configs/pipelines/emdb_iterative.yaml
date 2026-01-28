@@ -38,6 +38,10 @@ components:
     backend: vimo
     mode: accurate
     use_mean_shape: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
 
   # Stage 4: Evaluation (computes reprojection_error for convergence check)
   - type: evaluation
