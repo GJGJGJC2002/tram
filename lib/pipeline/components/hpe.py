@@ -6,7 +6,7 @@ import torch
 
 from lib.pipeline.core.component import BackendComponent
 from lib.pipeline.core.data import PipelineData, SMPLParams
-from lib.pipeline.backends.hpe import VIMOBackend
+from lib.pipeline.backends.hpe import VIMOBackend, GTSmplBackend
 
 
 class HPEComponent(BackendComponent):
@@ -25,6 +25,7 @@ class HPEComponent(BackendComponent):
     
     BACKENDS = {
         'vimo': VIMOBackend,
+        'gt': GTSmplBackend,
     }
     
     DEFAULT_BACKEND = 'vimo'
@@ -121,6 +122,68 @@ class HPEComponent(BackendComponent):
 
         结果存储在 data.smpl_params 中。
         """
+        # 根据后端类型调用不同的方法
+        if self.backend_type == 'gt':
+            return self._execute_gt(data)
+        else:
+            return self._execute_vimo(data)
+
+    def _execute_gt(self, data: PipelineData) -> PipelineData:
+        """使用 GT 后端执行"""
+        if data.annotations is None:
+            raise ValueError("GT backend requires annotations")
+
+        # 检查是否有帧采样信息
+        sampling_info = data.metadata.get('frame_sampling')
+        if sampling_info:
+            sampled_indices = np.array(sampling_info['sampled_indices'])
+        else:
+            sampled_indices = None
+
+        self.logger.info("Loading GT SMPL parameters...")
+
+        # 调用 GT 后端
+        smpl_results = self.backend.estimate_smpl(
+            annotations=data.annotations,
+            sampled_indices=sampled_indices
+        )
+
+        # 后处理
+        pred_shape = smpl_results['pred_shape']
+        if self.use_mean_shape:
+            mean_shape = pred_shape.mean(dim=0, keepdim=True)
+            pred_shape = mean_shape.repeat(len(pred_shape), 1)
+
+        # 从 annotations 中读取世界坐标系的 trans（global_trans）
+        if sampled_indices is not None:
+            global_trans = data.annotations['smpl']['trans'][sampled_indices]
+        else:
+            global_trans = data.annotations['smpl']['trans']
+
+        # 创建 SMPL 参数对象
+        data.smpl_params = SMPLParams(
+            poses=smpl_results['pred_pose'],
+            betas=pred_shape,
+            trans=smpl_results['pred_trans'],  # 相机坐标系
+            global_trans=torch.from_numpy(global_trans).float(),  # 世界坐标系
+            rotmat=smpl_results['pred_rotmat'],
+            pred_cam=smpl_results['pred_cam'],
+        )
+
+        # 记录元数据
+        num_frames = len(smpl_results['pred_trans'])
+        data.metadata['hpe_stats'] = {
+            'num_frames': num_frames,
+            'backend': 'gt',
+            'use_mean_shape': self.use_mean_shape,
+        }
+
+        self.logger.info(f"GT SMPL loaded for {num_frames} frames")
+
+        return data
+
+    def _execute_vimo(self, data: PipelineData) -> PipelineData:
+        """使用 VIMO 后端执行"""
         # 帧采样（如果配置了跳帧）
         self._sample_frames(data)
 
@@ -145,11 +208,44 @@ class HPEComponent(BackendComponent):
             mean_shape = pred_shape.mean(dim=0, keepdim=True)
             pred_shape = mean_shape.repeat(len(pred_shape), 1)
 
+        # 计算 global_trans（从相机坐标系转换到世界坐标系）
+        trans_cam = smpl_results['pred_trans']  # 相机坐标系
+        global_trans = None
+
+        # 如果有相机外参（c2w 变换），则转换到世界坐标系
+        if data.camera_params is not None and data.camera_params.R is not None and data.camera_params.T is not None:
+            R_cw = data.camera_params.R  # [N, 3, 3] 相机到世界的旋转
+            t_cw = data.camera_params.T  # [N, 3] 相机到世界的平移
+
+            # 转换到世界坐标系: p_world = R_cw @ p_cam + t_cw
+            if isinstance(R_cw, np.ndarray):
+                R_cw = torch.from_numpy(R_cw).float()
+            if isinstance(t_cw, np.ndarray):
+                t_cw = torch.from_numpy(t_cw).float()
+            if isinstance(trans_cam, np.ndarray):
+                trans_cam = torch.from_numpy(trans_cam).float()
+
+            # 确保形状一致
+            if len(R_cw.shape) == 3 and R_cw.shape[0] == trans_cam.shape[0]:
+                global_trans = torch.einsum('nij,nj->ni', R_cw, trans_cam) + t_cw
+                self.logger.info("Converted body trajectory from camera to world coordinate system")
+            else:
+                self.logger.warning(
+                    f"Cannot compute global_trans: shape mismatch "
+                    f"(R_cw: {R_cw.shape}, trans_cam: {trans_cam.shape})"
+                )
+        else:
+            self.logger.warning(
+                "No camera extrinsics available, using camera-coordinate trans. "
+                "Body trajectory will not be globally accurate."
+            )
+
         # 创建 SMPL 参数对象
         data.smpl_params = SMPLParams(
             poses=smpl_results['pred_pose'],
             betas=pred_shape,
-            trans=smpl_results['pred_trans'],
+            trans=trans_cam,  # 相机坐标系
+            global_trans=global_trans,  # 世界坐标系（如果有相机外参）
             rotmat=smpl_results['pred_rotmat'],
             pred_cam=smpl_results['pred_cam'],
         )
@@ -158,6 +254,7 @@ class HPEComponent(BackendComponent):
         num_frames = len(smpl_results['pred_pose'])
         data.metadata['hpe_stats'] = {
             'num_frames': num_frames,
+            'backend': 'vimo',
             'mode': self.mode,
             'use_mean_shape': self.use_mean_shape,
             'img_focal': img_focal,

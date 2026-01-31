@@ -5,13 +5,15 @@ from .segmentation import SegmentationComponent
 from .slam import SLAMComponent
 from .hpe import HPEComponent
 from .evaluation import EvaluationComponent
+from .adjacent_smpl_renderer import AdjacentSMPLRenderer
 
 __all__ = [
     'DetectionComponent',
-    'SegmentationComponent', 
+    'SegmentationComponent',
     'SLAMComponent',
     'HPEComponent',
     'EvaluationComponent',
+    'AdjacentSMPLRenderer',
 ]
 
 

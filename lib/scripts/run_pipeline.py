@@ -212,10 +212,6 @@ def main():
                        default='/home/gejunchen/Work/2026-1/Datasets/EMDB',
                        help='Path to EMDB dataset')
     
-    # 输出参数
-    parser.add_argument('--output_dir', type=str, default='results/pipeline',
-                       help='Output directory')
-    
     # Pipeline 参数
     parser.add_argument('--device', type=str, default='cuda',
                        help='Device (cuda or cpu)')
@@ -230,15 +226,25 @@ def main():
                        help='Enable visualization hooks')
     
     args = parser.parse_args()
-    
+
+    # 如果提供了配置文件，先加载配置
+    if args.config:
+        import yaml
+        with open(args.config, 'r') as f:
+            config = yaml.safe_load(f)
+        output_dir = config.get('output_dir')
+    else:
+        # 使用默认输出目录
+        output_dir = 'outputs/pipeline'
+
     # 设置日志
-    logger = setup_logging(args.output_dir)
+    logger = setup_logging(output_dir)
     logger.info('='*80)
     logger.info('EMDB Pipeline Runner')
     logger.info('='*80)
     logger.info(f'Start time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
     logger.info(f'Arguments: {vars(args)}')
-    
+
     # 创建 Pipeline
     if args.config:
         logger.info(f"Loading pipeline from config: {args.config}")
@@ -248,11 +254,8 @@ def main():
         pipeline = PipelineBuilder.create_evaluation_pipeline(
             name="emdb_eval",
             device=args.device,
-            output_dir=args.output_dir
+            output_dir=output_dir
         )
-    
-    # 配置更新
-    pipeline.config['output_dir'] = args.output_dir
     
     # 添加调试 hooks
     if args.debug:
@@ -295,13 +298,13 @@ def main():
         try:
             # 加载数据
             data = load_sequence_data(root)
-            data.metadata['output_dir'] = args.output_dir
-            
+            data.metadata['output_dir'] = output_dir
+
             # 执行 Pipeline
             result = pipeline.execute(data)
-            
+
             # 保存结果
-            seq_output_dir = os.path.join(args.output_dir, seq_name)
+            seq_output_dir = os.path.join(output_dir, seq_name)
             result.save_results(seq_output_dir)
             
             # 收集指标
@@ -346,13 +349,13 @@ def main():
         
         # 保存到 Excel
         df = pd.DataFrame(all_results)
-        excel_file = os.path.join(args.output_dir, 'evaluation_results.xlsx')
+        excel_file = os.path.join(output_dir, 'evaluation_results.xlsx')
         df.to_excel(excel_file, index=False)
         logger.info(f'Results saved to {excel_file}')
-        
+
         # 保存汇总
         summary_df = pd.DataFrame([avg_metrics])
-        summary_file = os.path.join(args.output_dir, 'summary.xlsx')
+        summary_file = os.path.join(output_dir, 'summary.xlsx')
         summary_df.to_excel(summary_file, index=False)
         logger.info(f'Summary saved to {summary_file}')
     else:

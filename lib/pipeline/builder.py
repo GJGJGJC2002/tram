@@ -13,6 +13,7 @@ from .components import (
     SLAMComponent,
     HPEComponent,
     EvaluationComponent,
+    AdjacentSMPLRenderer,
 )
 
 
@@ -47,6 +48,7 @@ class PipelineBuilder:
         'slam': SLAMComponent,
         'hpe': HPEComponent,
         'evaluation': EvaluationComponent,
+        'adjacent_smpl_renderer': AdjacentSMPLRenderer,
     }
     
     @classmethod

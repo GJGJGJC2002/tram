@@ -43,7 +43,8 @@ class SMPLParams:
     """SMPL 参数数据结构"""
     poses: Optional[Union[np.ndarray, torch.Tensor]] = None  # 姿态参数
     betas: Optional[Union[np.ndarray, torch.Tensor]] = None  # 形状参数
-    trans: Optional[Union[np.ndarray, torch.Tensor]] = None  # 平移
+    trans: Optional[Union[np.ndarray, torch.Tensor]] = None  # 相机坐标系下的平移
+    global_trans: Optional[Union[np.ndarray, torch.Tensor]] = None  # 世界坐标系下的平移
     rotmat: Optional[Union[np.ndarray, torch.Tensor]] = None  # 旋转矩阵
     pred_cam: Optional[Union[np.ndarray, torch.Tensor]] = None  # 预测的相机参数
     vertices: Optional[Union[np.ndarray, torch.Tensor]] = None  # 顶点

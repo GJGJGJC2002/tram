@@ -1,0 +1,67 @@
+# EMDB Adjacent Frame Rendering Pipeline (GT)
+# 使用GT的SMPL参数进行渲染
+
+name: "EMDB Adjacent Frame Rendering - GT"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/emdb_adjacent_render_gt"
+
+components:
+  # 1. Human Detection
+  - type: detection
+    name: human_detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+    max_detections: 10
+    arrange_mode: size
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. Human Segmentation
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 3. Camera Motion Estimation (使用 GT 相机参数)
+  - type: slam
+    name: camera_estimation
+    backend: gt  # 使用 GT 相机后端
+    use_masks: true
+    align_to_world: true
+    cache:
+      enabled: false
+      use_cache: false
+      overwrite: true
+
+  # 4. GT SMPL Parameters Loading (使用 GT SMPL 后端)
+  - type: hpe
+    name: gt_smpl_loading
+    backend: gt  # 使用 GT SMPL 后端
+    convert_to_rotmat: true
+    use_mean_shape: false  # GT 数据不使用平均形状
+
+  # 5. Adjacent Frame SMPL Rendering
+  - type: adjacent_smpl_renderer
+    name: adjacent_frame_rendering
+    pre_dis: 20
+    device: "cuda"
+    output_dir: "results/emdb_adjacent_render_gt"
+
+# Hooks
+hooks:
+  - stage: 'after_camera_estimation'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: True
+
+  - stage: 'after_gt_smpl_loading'
+    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+    enabled: True
+    params:
+      interval: 20

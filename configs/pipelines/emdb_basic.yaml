@@ -4,7 +4,7 @@
 name: "EMDB Basic Pipeline"
 mode: "sequential"
 device: "cuda"
-output_dir: "results/emdb"
+output_dir: "results/emdb_basic"
 
 # Save intermediate results for debugging
 save_intermediate: false
@@ -41,7 +41,7 @@ components:
     cache:
       enabled: true      # 启用缓存，SLAM通常很慢
       use_cache: true
-      overwrite: false
+      overwrite: true
 
   # 4. Human Pose Estimation
   - type: hpe
@@ -54,7 +54,7 @@ components:
     cache:
       enabled: true      # 启用缓存，保存 SMPL 估计结果
       use_cache: true    # 使用缓存，如果存在则跳过执行
-      overwrite: false   # 不覆盖已有缓存（设为true强制重新执行）
+      overwrite: true   # 不覆盖已有缓存（设为true强制重新执行）
 
   # 5. Evaluation
   - type: evaluation
@@ -81,3 +81,11 @@ hooks:
     enabled: True
     params:
       interval: 20
+
+  - stage: 'after_smpl_estimation'
+    function: 'lib.pipeline.hooks.visualize_body_trajectory'
+    enabled: True
+
+  - stage: 'after_camera_estimation'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: True

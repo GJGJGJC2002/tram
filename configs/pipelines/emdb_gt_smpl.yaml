@@ -1,0 +1,88 @@
+# EMDB GT SMPL Pipeline Configuration
+# 使用真值SMPL参数的Pipeline：相机估计 -> GT SMPL加载 -> 可视化/评估
+
+name: "EMDB GT SMPL Pipeline"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/emdb_gt_smpl"
+
+components:
+  # 1. Human Detection
+  - type: detection
+    name: human_detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+    max_detections: 10
+    arrange_mode: size
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. Human Segmentation (for SLAM masking)
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 3. Camera Motion Estimation (使用 GT 相机参数)
+  - type: slam
+    name: camera_estimation
+    backend: gt  # 使用 GT 相机后端
+    align_to_world: true
+    cache:
+      enabled: false
+      use_cache: false
+      overwrite: false
+
+  # 4. GT SMPL Parameters Loading (使用 GT SMPL 后端)
+  - type: hpe
+    name: gt_smpl_loading
+    backend: gt  # 使用 GT SMPL 后端
+    convert_to_rotmat: true
+    use_mean_shape: false  # GT 数据不使用平均形状
+    cache:
+      enabled: false  # GT数据加载很快，不需要缓存
+      use_cache: false
+      overwrite: false
+
+  # 5. Evaluation (使用GT SMPL进行评估)
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
+    chunk_length: 100
+    fps: 30
+
+# 格式："before_{component_name}" 或 "after_{component_name}"
+# {component_name} 是配置文件中组件的 name 字段，不是 type 字段
+# Hooks configuration
+hooks:
+  # GT SMPL mesh visualization (每20帧可视化一次，使用相机坐标系)
+  - stage: 'after_gt_smpl_loading'
+    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+    enabled: True
+    params:
+      interval: 20
+
+  # Camera trajectory visualization
+  - stage: 'after_camera_estimation'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: True
+
+  - stage: 'after_gt_smpl_loading'
+    function: 'lib.pipeline.hooks.visualize_body_trajectory'
+    enabled: True

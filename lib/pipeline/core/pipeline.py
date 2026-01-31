@@ -186,8 +186,9 @@ class Pipeline:
         
         start_time = time.time()
         data.metadata['pipeline_name'] = self.name
+        data.metadata['output_dir'] = self.output_dir  # 确保 hooks 使用正确的输出目录
         data.metadata['execution_start'] = datetime.now().isoformat()
-        
+
         try:
             # 获取缓存目录
             cache_dir = self._get_cache_dir(data)
@@ -279,8 +280,13 @@ class Pipeline:
                 if value is not None:
                     setattr(merged, field, value)
 
-        # 合并 metadata
+        # 合并 metadata（保留当前的关键配置）
+        # 不要让缓存覆盖 output_dir、pipeline_name 等配置
+        preserved_keys = {'output_dir', 'pipeline_name'}
+        preserved_metadata = {k: merged.metadata[k] for k in preserved_keys if k in merged.metadata}
         merged.metadata.update(cached_data.metadata)
+        # 恢复保留的配置
+        merged.metadata.update(preserved_metadata)
         merged.metadata['cache_loaded'] = True
         merged.metadata['cache_loaded_at'] = datetime.now().isoformat()
 

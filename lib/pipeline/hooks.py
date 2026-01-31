@@ -224,8 +224,65 @@ def visualize_camera_trajectory(data: PipelineData):
     
     plt.savefig(os.path.join(vis_dir, 'camera_trajectory.png'), dpi=150)
     plt.close()
-    
+
     logger.info(f"Camera trajectory visualization saved to {vis_dir}")
+
+
+def visualize_body_trajectory(data: PipelineData):
+    """可视化人体全局轨迹"""
+    try:
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+    except ImportError:
+        logger.warning("Visualization requires matplotlib")
+        return
+
+    if data.smpl_params is None:
+        logger.warning("No SMPL params available")
+        return
+
+    # 优先使用 global_trans（世界坐标系），如果没有则使用 trans（相机坐标系）
+    if data.smpl_params.global_trans is not None:
+        trans = data.smpl_params.global_trans
+        coord_system = "world"
+    elif data.smpl_params.trans is not None:
+        trans = data.smpl_params.trans
+        coord_system = "camera"
+        logger.warning("Only camera-coordinate trans available, trajectory may not be globally accurate")
+    else:
+        logger.warning("No body trajectory data available")
+        return
+
+    output_dir = data.metadata.get('output_dir', 'results')
+    vis_dir = os.path.join(output_dir, 'visualization', 'body')
+    os.makedirs(vis_dir, exist_ok=True)
+
+    if isinstance(trans, torch.Tensor):
+        trans = trans.numpy()
+
+    # trans shape: [N, 3] or [N, M, 3] (M = number of people)
+    if len(trans.shape) == 3:
+        # Multiple people, visualize the first one
+        logger.info(f"Multiple people detected ({trans.shape[1]}), visualizing first person")
+        trans = trans[:, 0, :]
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.plot(trans[:, 0], trans[:, 1], trans[:, 2], 'b-', linewidth=1)
+    ax.scatter(trans[0, 0], trans[0, 1], trans[0, 2], c='g', s=100, marker='o', label='Start')
+    ax.scatter(trans[-1, 0], trans[-1, 1], trans[-1, 2], c='r', s=100, marker='x', label='End')
+
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    ax.set_title(f'Body Trajectory ({coord_system} coordinate system)')
+    ax.legend()
+
+    plt.savefig(os.path.join(vis_dir, 'body_trajectory.png'), dpi=150)
+    plt.close()
+
+    logger.info(f"Body trajectory visualization saved to {vis_dir} ({coord_system} coords)")
 
 
 def visualize_smpl_mesh(data: PipelineData, interval: int = None):
@@ -241,10 +298,11 @@ def visualize_smpl_mesh(data: PipelineData, interval: int = None):
         interval = data.metadata.get('smpl_vis_interval', 100)
     try:
         import cv2
+        import numpy as np
         import torch
         from glob import glob
     except ImportError:
-        logger.warning("Visualization requires cv2, torch, glob")
+        logger.warning("Visualization requires cv2, numpy, torch, glob")
         return
 
     # 检查必要数据
@@ -282,13 +340,6 @@ def visualize_smpl_mesh(data: PipelineData, interval: int = None):
     # 获取相机参数
     img_focal = 1000.0  # 默认值
     img_center = None
-
-    # 尝试从 annotations 获取相机参数
-    if data.annotations and 'camera' in data.annotations:
-        intr = data.annotations['camera'].get('intrinsics')
-        if intr is not None:
-            img_focal = (intr[0, 0] + intr[1, 1]) / 2.0
-            img_center = intr[:2, 2]
 
     # 尝试从 camera_params 获取
     if data.camera_params and data.camera_params.focal_length:
@@ -399,6 +450,17 @@ def visualize_smpl_mesh(data: PipelineData, interval: int = None):
 
             vertices = smpl_output.vertices[0]  # [6890, 3] - 在 GPU 上
 
+            # 调试输出（第一帧和中间帧）
+            if frame_idx == 0 or frame_idx == 100:
+                logger.info(f"[DEBUG VISUALIZE] Frame {frame_idx}:")
+                logger.info(f"  trans: {tran.cpu().numpy() if hasattr(tran, 'cpu') else tran}")
+                logger.info(f"  vertices range: [{vertices.min():.2f}, {vertices.max():.2f}]")
+                logger.info(f"  vertices mean: {vertices.mean(dim=0).cpu().numpy()}")
+                logger.info(f"  vertices std: {vertices.std(dim=0).cpu().numpy()}")
+                logger.info(f"  img_focal: {img_focal:.2f}")
+                logger.info(f"  img_center: {img_center}")
+                logger.info(f"  img_size: ({img_width}, {img_height})")
+
             # 渲染（vertices 保持在 GPU 上，与 renderer 的设备一致）
             rendered_img = renderer.render_mesh(
                 vertices,  # GPU tensor
@@ -417,6 +479,177 @@ def visualize_smpl_mesh(data: PipelineData, interval: int = None):
             continue
 
     logger.info(f"SMPL mesh visualization saved to {vis_dir} (every {interval} frames)")
+
+
+def visualize_gt_smpl_mesh(data: PipelineData, interval: int = None):
+    """
+    可视化GT SMPL mesh（使用世界坐标系的trans）
+
+    专门用于GTSmplLoaderComponent加载的数据，使用metadata中保存的trans_world。
+    """
+    # 从 metadata 获取间隔，如果没有则使用默认值 100
+    if interval is None:
+        interval = data.metadata.get('smpl_vis_interval', 100)
+    try:
+        import cv2
+        import numpy as np
+        import torch
+        from glob import glob
+    except ImportError:
+        logger.warning("Visualization requires cv2, numpy, torch, glob")
+        return
+
+    # 检查必要数据
+    if data.smpl_params is None:
+        logger.info("No SMPL parameters to visualize")
+        return
+
+    # 检查是否有trans_world（GT SMPL特有的）
+    if 'trans_world' not in data.metadata:
+        logger.info("No trans_world in metadata, using standard visualization")
+        return visualize_smpl_mesh(data, interval)
+
+    if len(data.image_paths) == 0:
+        logger.info("No image paths available")
+        return
+
+    # 获取输出目录
+    output_dir = data.metadata.get('output_dir', 'results')
+    vis_dir = os.path.join(output_dir, 'visualization', 'smpl_mesh_gt')
+    os.makedirs(vis_dir, exist_ok=True)
+
+    # 延迟导入
+    try:
+        from lib.models.smpl import SMPL
+        from lib.vis.renderer import Renderer
+    except ImportError:
+        logger.warning("SMPL or Renderer not available")
+        return
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # 获取 SMPL 模型和 faces
+    smpl_model = SMPL().to(device)
+    faces = smpl_model.faces
+
+    # 获取图像尺寸
+    img_sample = cv2.imread(data.image_paths[0])
+    img_height, img_width = img_sample.shape[:2]
+
+    # 获取相机参数
+    img_focal = 1000.0
+    img_center = None
+
+    if data.annotations and 'camera' in data.annotations:
+        intr = data.annotations['camera'].get('intrinsics')
+        if intr is not None:
+            img_focal = (intr[0, 0] + intr[1, 1]) / 2.0
+            img_center = intr[:2, 2]
+
+    if data.camera_params and data.camera_params.focal_length:
+        img_focal = data.camera_params.focal_length
+        if data.camera_params.principal_point is not None:
+            img_center = data.camera_params.principal_point
+
+    if img_center is None:
+        img_center = np.array([img_width / 2, img_height / 2])
+
+    # 创建 renderer
+    renderer = Renderer(img_width, img_height, img_focal, device, faces=faces,
+                       bin_size=-1, max_faces_per_bin=30000)
+
+    # 获取 SMPL 参数
+    smpl = data.smpl_params
+    trans_world = data.metadata['trans_world']  # 世界坐标系的trans
+    poses_root_world = data.metadata.get('poses_root_world')  # 世界坐标系的root orientation
+
+    # 使用 rotmat
+    if smpl.rotmat is None:
+        logger.warning("SMPL rotmat is None, cannot visualize. Skipping visualization.")
+        return
+
+    poses = smpl.rotmat  # 相机坐标系 [N, 24, 3, 3]
+    betas = smpl.betas  # [N, 10]
+
+    # 转换为 tensor
+    if isinstance(poses, np.ndarray):
+        poses = torch.from_numpy(poses).float()
+    if isinstance(betas, np.ndarray):
+        betas = torch.from_numpy(betas).float()
+    if isinstance(trans_world, np.ndarray):
+        trans_world = torch.from_numpy(trans_world).float()
+
+    poses = poses.to(device)
+    betas = betas.to(device)
+    trans_world = trans_world.to(device)
+
+    # 将poses_root_world转换为rotation matrix
+    from lib.utils.rotation_conversions import axis_angle_to_matrix
+    if poses_root_world is not None:
+        if isinstance(poses_root_world, np.ndarray):
+            poses_root_world = torch.from_numpy(poses_root_world).float()
+        poses_root_world = poses_root_world.to(device)
+        root_rotmat_world = axis_angle_to_matrix(poses_root_world)  # [N, 3, 3]
+        root_rotmat_world = root_rotmat_world[:, None, :, :]  # [N, 1, 3, 3]
+
+        # 替换poses中的root orientation为世界坐标系的
+        body_rotmat = poses[:, 1:]  # [N, 23, 3, 3]
+        poses_world = torch.cat([root_rotmat_world, body_rotmat], dim=1)  # [N, 24, 3, 3]
+    else:
+        poses_world = poses
+
+    # 每隔 interval 帧可视化一次
+    num_frames = len(data.image_paths)
+    for frame_idx in range(0, num_frames, interval):
+        try:
+            # 加载图像
+            img = cv2.imread(data.image_paths[frame_idx])
+            if img is None:
+                continue
+
+            # 获取当前帧的 SMPL 参数
+            pose = poses_world[frame_idx:frame_idx+1]  # [1, 24, 3, 3]
+            beta = betas[frame_idx:frame_idx+1] if betas.dim() == 2 else betas  # [1, 10]
+            tran = trans_world[frame_idx]  # [3]
+
+            if tran.dim() == 1:
+                tran = tran.unsqueeze(0)  # -> [1, 3]
+
+            # 分离 global_orient 和 body_pose
+            global_orient = pose[:, [0]]  # [1, 1, 3, 3]
+            body_pose = pose[:, 1:]  # [1, 23, 3, 3]
+
+            # 推理 SMPL（使用世界坐标系的trans）
+            with torch.no_grad():
+                smpl_output = smpl_model(
+                    body_pose=body_pose,
+                    global_orient=global_orient,
+                    betas=beta,
+                    transl=tran,
+                    pose2rot=False,
+                    default_smpl=True
+                )
+
+            vertices = smpl_output.vertices[0]  # [6890, 3]
+
+            # 渲染
+            rendered_img = renderer.render_mesh(
+                vertices,
+                img.copy(),
+                colors=[0.5, 0.8, 0.5]
+            )
+
+            # 保存
+            output_path = os.path.join(vis_dir, f'frame_{frame_idx:04d}.jpg')
+            cv2.imwrite(output_path, rendered_img)
+
+        except Exception as e:
+            logger.warning(f"Failed to visualize frame {frame_idx}: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+            continue
+
+    logger.info(f"GT SMPL mesh visualization saved to {vis_dir} (every {interval} frames, world coordinate system)")
 
 
 # === 早停 Hooks ===
