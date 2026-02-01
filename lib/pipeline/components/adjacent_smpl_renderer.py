@@ -209,10 +209,28 @@ class AdjacentSMPLRenderer(Component):
         output_dir = os.path.join(self.output_dir, data.metadata.get('sequence_name', 'sequence'))
         os.makedirs(output_dir, exist_ok=True)
 
-        # 渲染每一帧
-        self.logger.info(f"Rendering {N} frames with pre_dis={self.pre_dis}...")
+        # 计算渲染的帧索引（每隔 pre_dis 帧）
+        rendered_indices = list(range(0, N, self.pre_dis))
 
-        for i in tqdm(range(N), desc="Rendering adjacent frames"):
+        # 如果总帧数不能整除 pre_dis，需要保存最后一帧用于后续 SLAM
+        # 最后一帧不会被渲染 mesh，但会参与 SLAM 过程（利用背景信息估计相机位姿）
+        last_frame_idx = N - 1
+        last_frame_saved = False
+        if last_frame_idx not in rendered_indices:
+            self.logger.info(f"Last frame {last_frame_idx} will be saved (not rendered) for SLAM")
+            # 保存最后一帧的原始图像（不渲染 mesh）
+            # 保持原始文件名，这样 DROID-SLAM 会读取它参与 SLAM
+            last_img = cv2.imread(img_paths[last_frame_idx])
+            last_img_name = os.path.basename(img_paths[last_frame_idx])
+            last_output_path = os.path.join(output_dir, last_img_name)
+            cv2.imwrite(last_output_path, last_img)
+            last_frame_saved = True
+            self.logger.info(f"Saved last frame to {last_output_path} for SLAM (will be included in DROID-SLAM processing)")
+
+        # 渲染每隔 pre_dis 帧的图像
+        self.logger.info(f"Rendering {len(rendered_indices)} frames (every {self.pre_dis}th frame)...")
+
+        for i in tqdm(rendered_indices, desc="Rendering adjacent frames"):
             img = cv2.imread(img_paths[i])
             final_img = img.copy()
             img_name = os.path.basename(img_paths[i])
@@ -231,7 +249,7 @@ class AdjacentSMPLRenderer(Component):
                     t_w2c = torch.from_numpy(t_w2c).float().to(self.device)
 
                 # 渲染前x帧（转换到当前帧相机坐标系）
-                if i > self.pre_dis:
+                if i - self.pre_dis >= 0:
                     verts_pre_world = torch.tensor(vertices[i - self.pre_dis]).to(self.device)  # [6890, 3]
                     verts_pre_cam = torch.einsum('ij,vj->vi', R_w2c, verts_pre_world) + t_w2c
                     final_img = render.render_mesh(verts_pre_cam, final_img)
@@ -248,7 +266,7 @@ class AdjacentSMPLRenderer(Component):
                     final_img = render.render_mesh(verts_next_cam, final_img)
             else:
                 # 相机坐标系，直接渲染
-                if i > self.pre_dis:
+                if i - self.pre_dis >= 0:
                     verts_pre = torch.tensor(vertices[i - self.pre_dis]).to(self.device)
                     final_img = render.render_mesh(verts_pre, final_img)
 
@@ -265,6 +283,20 @@ class AdjacentSMPLRenderer(Component):
 
         self.logger.info(f"Rendered images saved to {output_dir}")
         self.logger.info(f"  - Each frame shows: [pre_{self.pre_dis} | current | next_{self.pre_dis}]")
+        self.logger.info(f"  - Total frames rendered: {len(rendered_indices)} out of {N} total frames")
+        if last_frame_saved:
+            self.logger.info(f"  - Last frame {last_frame_idx} saved without mesh rendering (will be used by DROID-SLAM)")
+
+        # 保存渲染的帧索引到 metadata，供后续插值使用
+        # 注意：如果保存了最后一帧，DROID-SLAM 会读取 len(rendered_indices) + 1 帧
+        # 最后一帧的相机参数将用于插值时填充末尾帧
+        data.metadata['adjacent_render_info'] = {
+            'total_frames': N,
+            'pre_dis': self.pre_dis,
+            'rendered_indices': rendered_indices,
+            'last_frame_idx': last_frame_idx if last_frame_saved else None,
+            'num_processed_frames': len(rendered_indices) + (1 if last_frame_saved else 0),
+        }
 
         return data
 

@@ -1,5 +1,6 @@
 # EMDB Adjacent Frame Rendering Pipeline (TRAM/VIMO)
 # 使用TRAM预测的SMPL参数进行渲染
+# 然后使用渲染后的图像重新运行DROID-SLAM并插值回原始帧数
 
 name: "EMDB Adjacent Frame Rendering - TRAM"
 mode: "sequential"
@@ -57,10 +58,40 @@ components:
     name: adjacent_frame_rendering
     pre_dis: 20
     device: "cuda"
-    output_dir: "results/emdb_adjacent_render_tram"
+    output_dir: "results/emdb_adjacent_render_tram/adjacent_smpl"
+
+  # 6. Camera Motion Estimation (SLAM on rendered images with interpolation)
+  - type: slam
+    name: camera_estimation_tiaozhen
+    backend: droid_tiaozhen
+    use_masks: false  # 不使用 mask，因为已经在渲染时去除了人体
+    align_to_world: true
+    image_dir: "results/emdb_adjacent_render_tram/adjacent_smpl"  # 从 adjacent_smpl_renderer 的输出读取
+    cache:
+      enabled: false
+      use_cache: false
+      overwrite: false
 
 # Hooks
 hooks:
+  # Initial camera trajectory visualization
   - stage: 'after_camera_estimation'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: True
+
+  # SMPL mesh visualization
+  - stage: 'after_hpe_estimation'
+    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+    enabled: True
+    params:
+      interval: 20
+
+  # Body trajectory visualization
+  - stage: 'after_hpe_estimation'
+    function: 'lib.pipeline.hooks.visualize_body_trajectory'
+    enabled: True
+
+  # Re-run camera trajectory visualization (after interpolation)
+  - stage: 'after_camera_estimation_tiaozhen'
     function: 'lib.pipeline.hooks.visualize_camera_trajectory'
     enabled: True

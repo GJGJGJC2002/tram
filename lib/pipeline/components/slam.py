@@ -1,6 +1,7 @@
 """SLAMComponent - 相机运动估计组件"""
 
 import logging
+import os
 from typing import Dict, Any, Optional
 import numpy as np
 import torch
@@ -8,7 +9,7 @@ from glob import glob
 
 from lib.pipeline.core.component import BackendComponent
 from lib.pipeline.core.data import PipelineData, CameraParams
-from lib.pipeline.backends.slam import DroidSLAMBackend, GTCameraBackend
+from lib.pipeline.backends.slam import DroidSLAMBackend, GTCameraBackend, DroidTiaozhenBackend
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class SLAMComponent(BackendComponent):
     BACKENDS = {
         'droid': DroidSLAMBackend,
         'gt': GTCameraBackend,
+        'droid_tiaozhen': DroidTiaozhenBackend,
     }
     
     DEFAULT_BACKEND = 'droid'
@@ -63,6 +65,8 @@ class SLAMComponent(BackendComponent):
         # 根据后端类型调用不同的方法
         if self.backend_type == 'gt':
             return self._execute_gt(data)
+        elif self.backend_type == 'droid_tiaozhen':
+            return self._execute_tiaozhen(data)
         else:
             return self._execute_droid(data)
 
@@ -210,12 +214,97 @@ class SLAMComponent(BackendComponent):
         """计算轨迹长度"""
         if isinstance(cam_T, torch.Tensor):
             cam_T = cam_T.numpy()
-        
+
         if len(cam_T) < 2:
             return 0.0
-        
+
         diffs = np.diff(cam_T, axis=0)
         distances = np.linalg.norm(diffs, axis=1)
         return float(np.sum(distances))
+
+    def _execute_tiaozhen(self, data: PipelineData) -> PipelineData:
+        """使用 DroidTiaozhen 后端执行（带插值）"""
+        # 获取相邻帧渲染信息
+        adjacent_render_info = data.metadata.get('adjacent_render_info')
+        if adjacent_render_info is None:
+            raise ValueError(
+                "droid_tiaozhen backend requires adjacent_render_info in metadata. "
+                "Ensure adjacent_smpl_renderer component runs before this component."
+            )
+
+        # 获取处理后的图像目录
+        image_dir = self.config.get('image_dir')
+        if image_dir is None:
+            # 尝试从 metadata 中获取输出目录
+            sequence_name = data.metadata.get('sequence_name', 'sequence')
+            output_dir_base = self.config.get('output_dir', 'results/adjacent_smpl')
+            image_dir = os.path.join(output_dir_base, sequence_name)
+            self.logger.info(f"Using default image directory: {image_dir}")
+
+        # 获取相机内参
+        intrinsics = self._get_intrinsics(data)
+
+        self.logger.info(f"Running DROID-SLAM Tiaozhen on processed images...")
+        self.logger.info(f"  Image directory: {image_dir}")
+        self.logger.info(f"  Original frames: {adjacent_render_info['total_frames']}")
+        self.logger.info(f"  Processed frames: {len(adjacent_render_info['rendered_indices'])}")
+        self.logger.info(f"  Pre_dis: {adjacent_render_info['pre_dis']}")
+
+        # 估计相机运动（带插值）
+        cam_R, cam_T = self.backend.estimate_camera(
+            image_folder=None,  # 不使用，从 image_dir config 读取
+            masks=None,  # 不使用 mask，因为已经在渲染时去除了人体
+            intrinsics=intrinsics,
+            adjacent_render_info=adjacent_render_info,
+        )
+
+        # 获取 GT 内参（如果有）
+        if data.annotations and 'camera' in data.annotations:
+            gt_intrinsics = data.annotations['camera']['intrinsics']
+            focal_length = float(gt_intrinsics[0, 0])
+            principal_point = gt_intrinsics[:2, 2]
+        elif intrinsics:
+            focal_length = intrinsics[0]
+            principal_point = np.array(intrinsics[2:4])
+        else:
+            self.logger.warning("No camera intrinsics available, using defaults")
+            focal_length = 1000.0
+            principal_point = np.array([540, 960])
+
+        # 创建相机参数
+        camera_params = CameraParams(
+            R=cam_R,
+            T=cam_T,
+            intrinsics=data.annotations.get('camera', {}).get('intrinsics') if data.annotations else None,
+            focal_length=focal_length,
+            principal_point=principal_point,
+        )
+
+        # 对齐到世界坐标系（已经在 backend 中完成）
+        # 这里只需要保存额外的 metadata
+        if self.align_to_world:
+            data.metadata['spec_focal_tiaozhen'] = focal_length
+
+        # 注意：覆盖之前的 camera_params（如果需要保留之前的，可以使用不同的字段名）
+        data.camera_params = camera_params
+
+        # 统计
+        num_frames = len(cam_T)
+        trajectory_length = self._compute_trajectory_length(cam_T)
+        data.metadata['slam_stats_tiaozhen'] = {
+            'num_frames': num_frames,
+            'trajectory_length': trajectory_length,
+            'backend': 'droid_tiaozhen',
+            'pre_dis': adjacent_render_info['pre_dis'],
+            'original_total_frames': adjacent_render_info['total_frames'],
+        }
+
+        self.logger.info(
+            f"DROID-SLAM Tiaozhen completed: {num_frames} frames (interpolated from "
+            f"{len(adjacent_render_info['rendered_indices'])} processed frames), "
+            f"trajectory length: {trajectory_length:.2f}m"
+        )
+
+        return data
 
 

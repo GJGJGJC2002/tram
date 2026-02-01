@@ -50,18 +50,45 @@ components:
   # 5. Adjacent Frame SMPL Rendering
   - type: adjacent_smpl_renderer
     name: adjacent_frame_rendering
-    pre_dis: 20
+    pre_dis: 1
     device: "cuda"
     output_dir: "results/emdb_adjacent_render_gt"
+  
+  - type: slam
+    name: camera_estimation_tiaozhen
+    backend: droid_tiaozhen
+    use_masks: false  # 不使用 mask，因为已经在渲染时去除了人体
+    align_to_world: true
+    image_dir: "results/emdb_adjacent_render_gt/sequence"  # 从 adjacent_smpl_renderer 的输出读取
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: false
+
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
+    chunk_length: 100
+    fps: 30
 
 # Hooks
 hooks:
-  - stage: 'after_camera_estimation'
+  - stage: 'after_camera_estimation_tiaozhen'
     function: 'lib.pipeline.hooks.visualize_camera_trajectory'
     enabled: True
 
-  - stage: 'after_gt_smpl_loading'
-    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
-    enabled: True
-    params:
-      interval: 20
+  # - stage: 'after_gt_smpl_loading'
+  #   function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+  #   enabled: True
+  #   params:
+  #     interval: 20
