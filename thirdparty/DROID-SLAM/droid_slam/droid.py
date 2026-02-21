@@ -43,6 +43,27 @@ class Droid:
         # post processor - fill in poses for non-keyframes
         self.traj_filler = PoseTrajectoryFiller(self.net, self.video)
 
+    def enable_recording(self, enabled=True):
+        """Enable/disable recording of keyframe events and edge history"""
+        self.filterx._record_filter = enabled
+        self.frontend._record_keyframes = enabled
+        self.frontend.graph._record_edges = enabled
+
+    def get_debug_info(self):
+        """Collect all recorded debug information"""
+        n = self.video.counter.value
+        tstamps = self.video.tstamp.cpu().numpy()[:n].tolist()
+
+        info = {
+            'num_keyframes': n,
+            'keyframe_tstamps': tstamps,
+            'motion_filter_log': self.filterx.filter_log,
+            'keyframe_log': self.frontend.keyframe_log,
+            'edge_history': self.frontend.graph.edge_history,
+            'final_edge_snapshot': self.frontend.graph.get_edge_snapshot(),
+        }
+        return info
+
 
     def load_weights(self, weights):
         """ load trained model weights """

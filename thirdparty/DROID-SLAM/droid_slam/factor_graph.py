@@ -17,6 +17,10 @@ class FactorGraph:
         self.corr_impl = corr_impl
         self.upsample = upsample
 
+        # edge history hook for debugging
+        self.edge_history = []  # list of dicts recording edge events
+        self._record_edges = False  # set True to enable recording
+
         # operator at 1/8 resolution
         self.ht = ht = video.ht // 8
         self.wd = wd = video.wd // 8
@@ -99,6 +103,15 @@ class FactorGraph:
         if ii.shape[0] == 0:
             return
 
+        # hook: record edge additions
+        if self._record_edges:
+            self.edge_history.append({
+                'event': 'add',
+                'ii': ii.cpu().numpy().tolist(),
+                'jj': jj.cpu().numpy().tolist(),
+                'num_edges_before': len(self.ii),
+            })
+
         # place limit on number of factors
         if self.max_factors > 0 and self.ii.shape[0] + ii.shape[0] > self.max_factors \
                 and self.corr is not None and remove:
@@ -137,6 +150,16 @@ class FactorGraph:
     def rm_factors(self, mask, store=False):
         """ drop edges from factor graph """
 
+        # hook: record edge removals
+        if self._record_edges and mask.any():
+            self.edge_history.append({
+                'event': 'remove',
+                'ii': self.ii[mask].cpu().numpy().tolist(),
+                'jj': self.jj[mask].cpu().numpy().tolist(),
+                'store': store,
+                'num_edges_before': len(self.ii),
+            })
+
         # store estimated factors
         if store:
             self.ii_inac = torch.cat([self.ii_inac, self.ii[mask]], 0)
@@ -165,6 +188,12 @@ class FactorGraph:
     def rm_keyframe(self, ix):
         """ drop edges from factor graph """
 
+        # hook: record keyframe removal
+        if self._record_edges:
+            self.edge_history.append({
+                'event': 'rm_keyframe',
+                'keyframe_idx': ix,
+            })
 
         with self.video.get_lock():
             self.video.images[ix] = self.video.images[ix+1]
@@ -320,6 +349,13 @@ class FactorGraph:
     def add_neighborhood_factors(self, t0, t1, r=3):
         """ add edges between neighboring frames within radius r """
 
+        # hook: record neighborhood edge event
+        if self._record_edges:
+            self.edge_history.append({
+                'event': 'add_neighborhood',
+                't0': t0, 't1': t1, 'radius': r,
+            })
+
         ii, jj = torch.meshgrid(torch.arange(t0,t1), torch.arange(t0,t1), indexing='ij')
         ii = ii.reshape(-1).to(dtype=torch.long, device=self.device)
         jj = jj.reshape(-1).to(dtype=torch.long, device=self.device)
@@ -332,6 +368,13 @@ class FactorGraph:
     
     def add_proximity_factors(self, t0=0, t1=0, rad=2, nms=2, beta=0.25, thresh=16.0, remove=False):
         """ add edges to the factor graph based on distance """
+
+        # hook: record proximity edge event
+        if self._record_edges:
+            self.edge_history.append({
+                'event': 'add_proximity',
+                't0': t0, 't1': t1, 'rad': rad, 'nms': nms, 'thresh': thresh,
+            })
 
         t = self.video.counter.value
         ix = torch.arange(t0, t)
@@ -395,3 +438,17 @@ class FactorGraph:
 
         ii, jj = torch.as_tensor(es, device=self.device).unbind(dim=-1)
         self.add_factors(ii, jj, remove)
+
+    def get_edge_snapshot(self):
+        """Return a snapshot of all current edges for debugging"""
+        return {
+            'active_ii': self.ii.cpu().numpy().tolist(),
+            'active_jj': self.jj.cpu().numpy().tolist(),
+            'inactive_ii': self.ii_inac.cpu().numpy().tolist(),
+            'inactive_jj': self.jj_inac.cpu().numpy().tolist(),
+            'bad_ii': self.ii_bad.cpu().numpy().tolist(),
+            'bad_jj': self.jj_bad.cpu().numpy().tolist(),
+            'num_active': len(self.ii),
+            'num_inactive': len(self.ii_inac),
+            'num_bad': len(self.ii_bad),
+        }

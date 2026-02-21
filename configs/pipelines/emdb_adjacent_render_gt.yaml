@@ -51,15 +51,21 @@ components:
   - type: adjacent_smpl_renderer
     name: adjacent_frame_rendering
     pre_dis: 1
+    num_adjacent_frames: 2
     device: "cuda"
-    output_dir: "results/emdb_adjacent_render_gt"
-  
+    render_mode: "world"  # GT 模式：直接使用世界坐标系 trans 渲染，避免 Y 轴偏移
+    cache:
+      enabled: true
+      use_cache: true  # 设为 true 时直接读取 adjacent_smpl 目录的图片
+      overwrite: false   # 设为 true 时删除原目录下所有图片再重新渲染
+
   - type: slam
     name: camera_estimation_tiaozhen
     backend: droid_tiaozhen
-    use_masks: false  # 不使用 mask，因为已经在渲染时去除了人体
+    use_masks: false
     align_to_world: true
-    image_dir: "results/emdb_adjacent_render_gt/sequence"  # 从 adjacent_smpl_renderer 的输出读取
+    image_dir: null  # 自动从 adjacent_render_info 中获取，拼接 sequence_name
+    enable_scale_alignment: true #会矫正到GT的轨迹，就会导致和ate一致
     cache:
       enabled: true
       use_cache: false
@@ -87,8 +93,12 @@ hooks:
     function: 'lib.pipeline.hooks.visualize_camera_trajectory'
     enabled: True
 
-  # - stage: 'after_gt_smpl_loading'
-  #   function: 'lib.pipeline.hooks.visualize_smpl_mesh'
-  #   enabled: True
-  #   params:
-  #     interval: 20
+  - stage: 'after_camera_estimation_tiaozhen'
+    function: 'lib.pipeline.hooks.save_droid_debug_info'
+    enabled: True
+
+  - stage: 'after_gt_smpl_loading'
+    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+    enabled: True
+    params:
+      interval: 20

@@ -64,10 +64,11 @@ def memory_cleanup(data: PipelineData):
 def save_intermediate_results(data: PipelineData):
     """保存中间结果"""
     output_dir = data.metadata.get('output_dir', 'results/intermediate')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
     stage = data.current_stage
     iteration = data.iteration
     
-    save_dir = os.path.join(output_dir, f'iter{iteration}', stage)
+    save_dir = os.path.join(output_dir, seq_name, 'intermediate', f'iter{iteration}', stage)
     os.makedirs(save_dir, exist_ok=True)
     
     # 保存相机参数
@@ -98,7 +99,8 @@ def save_masks(data: PipelineData):
         return
     
     output_dir = data.metadata.get('output_dir', 'results')
-    masks_dir = os.path.join(output_dir, 'masks', data.sequence_name or 'unnamed')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    masks_dir = os.path.join(output_dir, seq_name, 'masks')
     os.makedirs(masks_dir, exist_ok=True)
     
     torch.save(data.masks, os.path.join(masks_dir, 'masks.pt'))
@@ -169,7 +171,8 @@ def visualize_detection(data: PipelineData):
         return
     
     output_dir = data.metadata.get('output_dir', 'results')
-    vis_dir = os.path.join(output_dir, 'visualization', 'detection')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'detection')
     os.makedirs(vis_dir, exist_ok=True)
     
     # 可视化前几帧
@@ -202,7 +205,8 @@ def visualize_camera_trajectory(data: PipelineData):
         return
     
     output_dir = data.metadata.get('output_dir', 'results')
-    vis_dir = os.path.join(output_dir, 'visualization', 'camera')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'camera')
     os.makedirs(vis_dir, exist_ok=True)
     
     T = data.camera_params.T
@@ -254,7 +258,8 @@ def visualize_body_trajectory(data: PipelineData):
         return
 
     output_dir = data.metadata.get('output_dir', 'results')
-    vis_dir = os.path.join(output_dir, 'visualization', 'body')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'body')
     os.makedirs(vis_dir, exist_ok=True)
 
     if isinstance(trans, torch.Tensor):
@@ -316,7 +321,8 @@ def visualize_smpl_mesh(data: PipelineData, interval: int = None):
 
     # 获取输出目录
     output_dir = data.metadata.get('output_dir', 'results')
-    vis_dir = os.path.join(output_dir, 'visualization', 'smpl_mesh')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'smpl_mesh')
     os.makedirs(vis_dir, exist_ok=True)
 
     # 延迟导入（避免启动时加载）
@@ -515,7 +521,8 @@ def visualize_gt_smpl_mesh(data: PipelineData, interval: int = None):
 
     # 获取输出目录
     output_dir = data.metadata.get('output_dir', 'results')
-    vis_dir = os.path.join(output_dir, 'visualization', 'smpl_mesh_gt')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'smpl_mesh_gt')
     os.makedirs(vis_dir, exist_ok=True)
 
     # 延迟导入
@@ -683,6 +690,122 @@ def early_stopping_on_convergence(data: PipelineData):
                 data.should_stop = True
         
         data.metadata['_prev_convergence_value'] = current_value
+
+
+def save_droid_debug_info(data: PipelineData):
+    """
+    保存 DROID-SLAM 的 frontend 调试信息摘要
+    
+    读取 run_slam 自动生成的 debug JSON 文件，提取关键信息并保存可读摘要。
+    包含：关键帧选择、MotionFilter 过滤情况、Frontend 建边关系等。
+    """
+    debug_path = data.metadata.get('droid_debug_path')
+    if debug_path is None or not os.path.exists(debug_path):
+        logger.info("No DROID debug info found, skipping")
+        return
+
+    output_dir = data.metadata.get('output_dir', 'results')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'droid_debug')
+    os.makedirs(vis_dir, exist_ok=True)
+
+    try:
+        with open(debug_path, 'r') as f:
+            debug_info = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load DROID debug info: {e}")
+        return
+
+    # 1. 生成可读摘要
+    summary_lines = []
+    summary_lines.append("=" * 60)
+    summary_lines.append("DROID-SLAM Frontend Debug Summary")
+    summary_lines.append("=" * 60)
+
+    # 关键帧信息
+    num_kf = debug_info.get('num_keyframes', 0)
+    kf_tstamps = debug_info.get('keyframe_tstamps', [])
+    summary_lines.append(f"\n[Keyframes] Total: {num_kf}")
+    summary_lines.append(f"  Timestamps: {kf_tstamps}")
+
+    num_kf_backend = debug_info.get('num_keyframes_after_backend', 0)
+    kf_tstamps_backend = debug_info.get('keyframe_tstamps_after_backend', [])
+    summary_lines.append(f"\n[Keyframes After Backend] Total: {num_kf_backend}")
+    summary_lines.append(f"  Timestamps: {kf_tstamps_backend}")
+
+    # MotionFilter 统计
+    filter_log = debug_info.get('motion_filter_log', [])
+    accepted = [e for e in filter_log if e.get('accepted')]
+    rejected = [e for e in filter_log if not e.get('accepted')]
+    summary_lines.append(f"\n[MotionFilter] Total frames: {len(filter_log)}, "
+                         f"Accepted: {len(accepted)}, Rejected: {len(rejected)}")
+    if rejected:
+        flow_mags = [e['flow_magnitude'] for e in rejected if e.get('flow_magnitude') is not None]
+        if flow_mags:
+            summary_lines.append(f"  Rejected flow magnitudes: min={min(flow_mags):.3f}, "
+                                 f"max={max(flow_mags):.3f}, mean={sum(flow_mags)/len(flow_mags):.3f}")
+        rejected_tstamps = [e['tstamp'] for e in rejected]
+        summary_lines.append(f"  Rejected timestamps: {rejected_tstamps}")
+
+    # Frontend 关键帧决策
+    kf_log = debug_info.get('keyframe_log', [])
+    removed_kfs = [e for e in kf_log if e.get('event') == 'remove_keyframe']
+    kept_kfs = [e for e in kf_log if e.get('event') == 'keep_keyframe']
+    summary_lines.append(f"\n[Frontend Keyframe Decisions] Keep: {len(kept_kfs)}, Remove: {len(removed_kfs)}")
+    for e in removed_kfs:
+        summary_lines.append(f"  Removed kf_idx={e.get('keyframe_idx')}, "
+                             f"tstamp={e.get('tstamp')}, "
+                             f"dist={e.get('distance', 0):.4f} < thresh={e.get('threshold', 0):.4f}")
+
+    # 最终边快照
+    final_snap = debug_info.get('final_edge_snapshot', {})
+    summary_lines.append(f"\n[Final Edge Snapshot (before backend)]")
+    summary_lines.append(f"  Active edges: {final_snap.get('num_active', 0)}")
+    summary_lines.append(f"  Inactive edges: {final_snap.get('num_inactive', 0)}")
+    summary_lines.append(f"  Bad edges: {final_snap.get('num_bad', 0)}")
+
+    # 活跃边列表
+    active_ii = final_snap.get('active_ii', [])
+    active_jj = final_snap.get('active_jj', [])
+    if active_ii:
+        summary_lines.append(f"  Active edges (ii->jj):")
+        edges_str = [f"({i},{j})" for i, j in zip(active_ii, active_jj)]
+        # 每行最多打印 10 条边
+        for start in range(0, len(edges_str), 10):
+            summary_lines.append(f"    {', '.join(edges_str[start:start+10])}")
+
+    # Edge history 统计
+    edge_hist = debug_info.get('edge_history', [])
+    add_events = [e for e in edge_hist if e.get('event') == 'add']
+    rm_events = [e for e in edge_hist if e.get('event') == 'remove']
+    neighborhood_events = [e for e in edge_hist if e.get('event') == 'add_neighborhood']
+    proximity_events = [e for e in edge_hist if e.get('event') == 'add_proximity']
+    summary_lines.append(f"\n[Edge History]")
+    summary_lines.append(f"  add_neighborhood calls: {len(neighborhood_events)}")
+    summary_lines.append(f"  add_proximity calls: {len(proximity_events)}")
+    summary_lines.append(f"  add_factors calls: {len(add_events)}")
+    summary_lines.append(f"  remove_factors calls: {len(rm_events)}")
+    total_added = sum(len(e.get('ii', [])) for e in add_events)
+    total_removed = sum(len(e.get('ii', [])) for e in rm_events)
+    summary_lines.append(f"  Total edges added: {total_added}")
+    summary_lines.append(f"  Total edges removed: {total_removed}")
+
+    summary_lines.append("\n" + "=" * 60)
+
+    summary_text = '\n'.join(summary_lines)
+
+    # 保存摘要文本
+    summary_path = os.path.join(vis_dir, 'droid_debug_summary.txt')
+    with open(summary_path, 'w') as f:
+        f.write(summary_text)
+
+    # 同时复制原始 JSON 到 vis_dir
+    import shutil
+    json_copy_path = os.path.join(vis_dir, 'droid_frontend_debug.json')
+    shutil.copy2(debug_path, json_copy_path)
+
+    logger.info(f"DROID debug summary saved to {summary_path}")
+    logger.info(f"\n{summary_text}")
 
 
 # === Hook 集合 ===

@@ -25,6 +25,10 @@ class MotionFilter:
 
         self.count = 0
 
+        # hook: record which frames are accepted/rejected as keyframes
+        self.filter_log = []  # list of dicts
+        self._record_filter = False  # set True to enable
+
         # mean, std for image normalization
         self.MEAN = torch.as_tensor([0.485, 0.456, 0.406], device=self.device)[:, None, None]
         self.STDV = torch.as_tensor([0.229, 0.224, 0.225], device=self.device)[:, None, None]
@@ -67,10 +71,15 @@ class MotionFilter:
             net, inp = self.__context_encoder(inputs[:,[0]])
             self.net, self.inp, self.fmap = net, inp, gmap
             self.video.append(tstamp, image[0], Id, 1.0, depth, intrinsics / 8.0, gmap, net[0,0], inp[0,0], mask)
-            # msk: torch.Size([64, 48])
-            # gmap: torch.Size([1, 128, 64, 48])
-            # net: torch.Size([1, 128, 64, 48])
-            # inp: torch.Size([1, 128, 64, 48])
+
+            if self._record_filter:
+                self.filter_log.append({
+                    'tstamp': int(tstamp),
+                    'accepted': True,
+                    'reason': 'first_frame',
+                    'flow_magnitude': None,
+                    'keyframe_idx': 0,
+                })
 
         ### only add new frame if there is enough motion ###
         else:                
@@ -81,12 +90,33 @@ class MotionFilter:
             # approximate flow magnitude using 1 update iteration
             _, delta, weight = self.update(self.net[None], self.inp[None], corr)
 
+            flow_mag = delta.norm(dim=-1).mean().item()
+
             # check motion magnitue / add new frame to video
-            if delta.norm(dim=-1).mean().item() > self.thresh:
+            if flow_mag > self.thresh:
                 self.count = 0
                 net, inp = self.__context_encoder(inputs[:,[0]])
                 self.net, self.inp, self.fmap = net, inp, gmap
                 self.video.append(tstamp, image[0], None, None, depth, intrinsics / 8.0, gmap, net[0], inp[0], mask)
 
+                if self._record_filter:
+                    self.filter_log.append({
+                        'tstamp': int(tstamp),
+                        'accepted': True,
+                        'reason': 'motion_above_thresh',
+                        'flow_magnitude': flow_mag,
+                        'threshold': self.thresh,
+                        'keyframe_idx': self.video.counter.value - 1,
+                    })
+
             else:
                 self.count += 1
+
+                if self._record_filter:
+                    self.filter_log.append({
+                        'tstamp': int(tstamp),
+                        'accepted': False,
+                        'reason': 'motion_below_thresh',
+                        'flow_magnitude': flow_mag,
+                        'threshold': self.thresh,
+                    })

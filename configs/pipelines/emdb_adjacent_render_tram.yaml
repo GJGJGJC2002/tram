@@ -47,7 +47,6 @@ components:
     backend: vimo
     mode: accurate
     use_mean_shape: true
-    frame_stride: 1
     cache:
       enabled: true
       use_cache: true
@@ -56,9 +55,9 @@ components:
   # 5. Adjacent Frame SMPL Rendering
   - type: adjacent_smpl_renderer
     name: adjacent_frame_rendering
-    pre_dis: 20
+    pre_dis: 1
+    num_adjacent_frames: 2
     device: "cuda"
-    output_dir: "results/emdb_adjacent_render_tram/adjacent_smpl"
 
   # 6. Camera Motion Estimation (SLAM on rendered images with interpolation)
   - type: slam
@@ -66,11 +65,27 @@ components:
     backend: droid_tiaozhen
     use_masks: false  # 不使用 mask，因为已经在渲染时去除了人体
     align_to_world: true
-    image_dir: "results/emdb_adjacent_render_tram/adjacent_smpl"  # 从 adjacent_smpl_renderer 的输出读取
+    image_dir: null  # 自动从 adjacent_render_info 中获取，拼接 sequence_name
     cache:
-      enabled: false
-      use_cache: false
+      enabled: true
+      use_cache: true
       overwrite: false
+
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
+    chunk_length: 100
+    fps: 30
 
 # Hooks
 hooks:
@@ -79,12 +94,12 @@ hooks:
     function: 'lib.pipeline.hooks.visualize_camera_trajectory'
     enabled: True
 
-  # SMPL mesh visualization
-  - stage: 'after_hpe_estimation'
-    function: 'lib.pipeline.hooks.visualize_smpl_mesh'
-    enabled: True
-    params:
-      interval: 20
+  # # SMPL mesh visualization
+  # - stage: 'after_hpe_estimation'
+  #   function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+  #   enabled: True
+  #   params:
+  #     interval: 20
 
   # Body trajectory visualization
   - stage: 'after_hpe_estimation'

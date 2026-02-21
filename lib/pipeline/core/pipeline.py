@@ -187,6 +187,7 @@ class Pipeline:
         start_time = time.time()
         data.metadata['pipeline_name'] = self.name
         data.metadata['output_dir'] = self.output_dir  # 确保 hooks 使用正确的输出目录
+        data.metadata['sequence_name'] = data.sequence_name or 'unnamed'  # 确保所有组件和 hooks 可以通过 metadata 获取序列名
         data.metadata['execution_start'] = datetime.now().isoformat()
 
         try:
@@ -228,6 +229,11 @@ class Pipeline:
                     # 保存中间结果
                     if cache_enabled:
                         self._save_intermediate(data, component.name)
+
+                    # 执行完后释放组件资源（模型、GPU显存等）
+                    # 下次需要时会通过 lazy setup 重新加载
+                    component.cleanup()
+                    self.logger.info(f"[{i+1}/{len(self.components)}] Released {component.name} resources")
 
                 # 执行后 Hook
                 self._run_hooks(f"after_{component.name}", data)
@@ -282,7 +288,7 @@ class Pipeline:
 
         # 合并 metadata（保留当前的关键配置）
         # 不要让缓存覆盖 output_dir、pipeline_name 等配置
-        preserved_keys = {'output_dir', 'pipeline_name'}
+        preserved_keys = {'output_dir', 'pipeline_name', 'sequence_name'}
         preserved_metadata = {k: merged.metadata[k] for k in preserved_keys if k in merged.metadata}
         merged.metadata.update(cached_data.metadata)
         # 恢复保留的配置
@@ -327,16 +333,16 @@ class Pipeline:
             return None
 
     def _save_intermediate(self, data: PipelineData, stage_name: str):
-        """保存中间结果"""
+        """保存中间结果（增量 + 压缩）"""
         cache_dir = self._get_cache_dir(data)
         os.makedirs(cache_dir, exist_ok=True)
 
-        # 保存完整的数据对象
+        # 保存增量数据对象（只包含当前阶段新增的字段，使用 gzip 压缩）
         cache_path = self._get_cache_path(cache_dir, stage_name, data.iteration)
-        data.save(cache_path)
+        data.save(cache_path, incremental=True)
         self.logger.info(f"Saved intermediate results for '{stage_name}' to {cache_path}")
 
-        # 同时保存各个独立的文件（保持向后兼容）
+        # 只保存轻量级的独立文件（camera.npz, smpl.npz），不再重复保存大体积的 masks.pt
         prefix = f"iter{data.iteration}_{stage_name}"
         data.save_results(cache_dir, prefix)
     

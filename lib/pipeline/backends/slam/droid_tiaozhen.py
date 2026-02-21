@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from glob import glob
 import os
+from scipy.spatial.transform import Rotation as RotLib
 
 from lib.pipeline.core.component import Backend
 
@@ -58,7 +59,7 @@ class DroidTiaozhenBackend(Backend):
 
         Args:
             image_folder: 原始图像文件夹（未使用，保留接口兼容性）
-            masks: 人体 mask（未使用，因为已经在渲染时去除了人体）
+            masks: 人体 mask，按 rendered_indices 下采样后的，与渲染图像帧一一对应
             intrinsics: 相机内参 [fx, fy, cx, cy]
             annotations: 标注数据（未使用）
             adjacent_render_info: adjacent_smpl_renderer 的渲染信息
@@ -78,9 +79,12 @@ class DroidTiaozhenBackend(Backend):
             raise ValueError("adjacent_render_info is required for interpolation")
 
         # 获取处理后的图像目录
-        image_dir = self.config['image_dir']
+        image_dir = self.config.get('image_dir')
         if image_dir is None:
-            raise ValueError("image_dir must be specified in config")
+            # 从 adjacent_render_info 中获取输出目录
+            image_dir = adjacent_render_info.get('output_dir')
+        if image_dir is None:
+            raise ValueError("image_dir must be specified in config or adjacent_render_info")
 
         self.logger.info(f"Running DROID-SLAM on processed images from {image_dir}")
 
@@ -107,7 +111,7 @@ class DroidTiaozhenBackend(Backend):
 
         cam_R, cam_T = run_metric_slam(
             image_dir,
-            masks=None,  # 不使用 mask，因为已经在渲染时去除了人体
+            masks=masks,  # 使用当前帧人体 mask，辅助 SLAM 前后端
             calib=intrinsics,
             is_static=is_static
         )
@@ -333,6 +337,118 @@ class DroidTiaozhenBackend(Backend):
         )
 
         return world_R, world_T, spec_f
+
+    def align_scale_to_reference(
+        self,
+        cam_R: torch.Tensor,
+        cam_T: torch.Tensor,
+        ref_R: torch.Tensor,
+        ref_T: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        将 tiaozhen 轨迹的尺度对齐到参考轨迹（第一次 SLAM 的结果）
+
+        使用 Sim3 对齐求解最优尺度因子 s，然后只应用尺度校正到 cam_T 上，
+        保留 tiaozhen 改善过的轨迹形状。
+
+        Args:
+            cam_R: tiaozhen 的旋转 [N, 3, 3]
+            cam_T: tiaozhen 的平移 [N, 3]
+            ref_R: 参考（第一次 SLAM）的旋转 [N, 3, 3]
+            ref_T: 参考（第一次 SLAM）的平移 [N, 3]
+
+        Returns:
+            cam_R: 旋转不变 [N, 3, 3]
+            cam_T_scaled: 尺度校正后的平移 [N, 3]
+        """
+        # 转换为 numpy
+        if isinstance(cam_T, torch.Tensor):
+            cam_T_np = cam_T.cpu().numpy()
+        else:
+            cam_T_np = np.array(cam_T)
+
+        if isinstance(ref_T, torch.Tensor):
+            ref_T_np = ref_T.cpu().numpy()
+        else:
+            ref_T_np = np.array(ref_T)
+
+        # 使用 evo 的 Umeyama 对齐来估计 Sim3 变换（包含尺度）
+        # 这里我们需要：给定 tiaozhen 轨迹和参考轨迹，求 s, R, t 使得
+        # ref_T ≈ s * R @ cam_T + t
+        # 然后只取 s 来缩放 cam_T
+        try:
+            from evo.core import trajectory, sync
+            from evo.core.trajectory import PoseTrajectory3D
+
+            n = min(len(cam_T_np), len(ref_T_np))
+            cam_T_np = cam_T_np[:n]
+            ref_T_np = ref_T_np[:n]
+
+            # 使用 Umeyama 算法估计 Sim3
+            # umeyama: src -> tgt, 求 s, R, t 使得 tgt = s*R*src + t
+            s, R_align, t_align = self._umeyama_alignment(cam_T_np, ref_T_np)
+
+            self.logger.info(f"Scale alignment: s={s:.4f}")
+
+            # 只应用尺度因子到 cam_T
+            if isinstance(cam_T, torch.Tensor):
+                cam_T_scaled = cam_T * s
+            else:
+                cam_T_scaled = torch.from_numpy(cam_T_np * s).float()
+
+            return cam_R, cam_T_scaled
+
+        except Exception as e:
+            self.logger.warning(f"Scale alignment failed: {e}, returning original trajectory")
+            return cam_R, cam_T
+
+    @staticmethod
+    def _umeyama_alignment(src: np.ndarray, tgt: np.ndarray) -> Tuple[float, np.ndarray, np.ndarray]:
+        """
+        Umeyama 算法：求解 Sim3 对齐 tgt = s * R @ src + t
+
+        Args:
+            src: 源点集 [N, 3]
+            tgt: 目标点集 [N, 3]
+
+        Returns:
+            s: 尺度因子
+            R: 旋转矩阵 [3, 3]
+            t: 平移向量 [3]
+        """
+        assert src.shape == tgt.shape
+        n, dim = src.shape
+
+        # 去均值
+        src_mean = src.mean(axis=0)
+        tgt_mean = tgt.mean(axis=0)
+        src_centered = src - src_mean
+        tgt_centered = tgt - tgt_mean
+
+        # 方差
+        src_var = np.sum(src_centered ** 2) / n
+
+        # 协方差矩阵
+        H = (tgt_centered.T @ src_centered) / n
+
+        # SVD
+        U, D, Vt = np.linalg.svd(H)
+
+        # 处理反射
+        S = np.eye(dim)
+        if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+            S[dim - 1, dim - 1] = -1
+
+        # 旋转
+        R = U @ S @ Vt
+
+        # 尺度
+        s = np.trace(np.diag(D) @ S) / src_var
+
+        # 平移
+        t = tgt_mean - s * R @ src_mean
+
+        return s, R, t
 
     def cleanup(self):
         """清理资源"""

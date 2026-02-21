@@ -105,9 +105,13 @@ class Component(ABC):
         清理资源（释放模型、GPU 内存等）
         
         子类可以重写此方法来释放资源。
+        Pipeline 会在每个组件执行完后自动调用此方法，
+        下次需要时通过 ensure_setup() 重新加载。
         """
         self._cache.clear()
-        if self.device == 'cuda':
+        if torch.cuda.is_available():
+            import gc
+            gc.collect()
             torch.cuda.empty_cache()
         self._is_setup = False
         self.logger.debug(f"Component {self.name} cleaned up")

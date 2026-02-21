@@ -1,0 +1,111 @@
+# EMDB Adjacent Frame Rendering Pipeline (GT + Keyframe)
+# 基于 GT SMPL 参数，使用第一次 SLAM 的关键帧信息指导渲染和第二次 warm start SLAM
+# 关键帧上渲染邻居 SMPL mesh，非关键帧用 mask 去人，第二次 SLAM 强制使用第一次关键帧并 warm start
+
+name: "EMDB Adjacent Frame Rendering - GT Keyframe"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/emdb_adjacent_render_gt_keyframe"
+
+components:
+  # 1. Human Detection
+  - type: detection
+    name: human_detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+    max_detections: 10
+    arrange_mode: size
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. Human Segmentation
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 3. Camera Motion Estimation (第一次 DROID-SLAM，提取关键帧信息)
+  - type: slam
+    name: camera_estimation
+    backend: droid
+    use_masks: true
+    align_to_world: true
+    return_keyframe_info: true  # 额外返回 keyframe_tstamps、poses、disps
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true  # 总是覆盖缓存，确保 keyframe_info 是最新的
+
+  # 4. GT SMPL Parameters Loading
+  - type: hpe
+    name: gt_smpl_loading
+    backend: gt
+    convert_to_rotmat: true
+    use_mean_shape: false
+
+  # 5. Adjacent Frame SMPL Rendering (keyframe 模式)
+  - type: adjacent_smpl_renderer
+    name: adjacent_frame_rendering
+    num_adjacent_frames: 8
+    device: "cuda"
+    render_mode: "world"
+    frame_selection_mode: "keyframe"  # 全帧输出：关键帧渲染邻居 SMPL，非关键帧 mask 去人
+    render_only_keyframes: true  # 只渲染关键帧，跳过非关键帧以节省时间（配合 use_rendered_for_keyframes 使用）
+    cache:
+      enabled: true
+      use_cache: false  # 设为 true 时直接读取 adjacent_smpl 目录的图片
+      overwrite: true   # 设为 true 时删除原目录下所有图片再重新渲染
+
+  # 6. Camera Estimation Warmstart (第二次 SLAM，forced keyframes + warm start)
+  - type: slam
+    name: camera_estimation_warmstart
+    backend: droid_warmstart
+    use_masks: true  # 非关键帧使用 mask 去人
+    align_to_world: true
+    image_dir: null  # 自动从 adjacent_render_info 获取
+    enable_scale_alignment: false
+    use_warmstart_poses: false  # 不注入 warmstart poses
+    use_rendered_for_keyframes: true  # 关键帧使用 adjacent_smpl/ 渲染图像（带 SMPL mesh）
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 7. Evaluation
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_camera_estimation_warmstart'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: True
+
+  # - stage: 'after_camera_estimation_warmstart'
+  #   function: 'lib.pipeline.hooks.save_droid_debug_info'
+  #   enabled: True
+
+  # - stage: 'after_gt_smpl_loading'
+  #   function: 'lib.pipeline.hooks.visualize_smpl_mesh'
+  #   enabled: True
+  #   params:
+  #     interval: 20

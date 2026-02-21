@@ -38,8 +38,9 @@ class DroidSLAMBackend(Backend):
         image_folder: str,
         masks: Optional[torch.Tensor] = None,
         intrinsics: Optional[List[float]] = None,
-        is_static: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        is_static: bool = False,
+        return_keyframe_info: bool = False
+    ):
         """
         估计相机运动
         
@@ -48,31 +49,30 @@ class DroidSLAMBackend(Backend):
             masks: 人体 mask [N, H, W]，用于遮挡
             intrinsics: 相机内参 [fx, fy, cx, cy]
             is_static: 是否为静态相机
+            return_keyframe_info: 是否额外返回关键帧信息（用于 warm start）
         
         Returns:
             cam_R: 相机旋转矩阵 [N, 3, 3]
             cam_T: 相机平移向量 [N, 3]
+            keyframe_info: (仅当 return_keyframe_info=True) 包含 keyframe_tstamps, poses_se3, disps 的 dict
         """
         self.ensure_setup()
         
         from lib.camera import run_metric_slam
         
         # 运行 DROID-SLAM
+        kwargs = dict(calib=intrinsics, is_static=is_static, return_keyframe_info=return_keyframe_info)
         if self.use_masks and masks is not None:
-            cam_R, cam_T = run_metric_slam(
-                image_folder, 
-                masks=masks, 
-                calib=intrinsics,
-                is_static=is_static
-            )
+            result = run_metric_slam(image_folder, masks=masks, **kwargs)
         else:
-            cam_R, cam_T = run_metric_slam(
-                image_folder,
-                calib=intrinsics,
-                is_static=is_static
-            )
+            result = run_metric_slam(image_folder, **kwargs)
         
-        return cam_R, cam_T
+        if return_keyframe_info:
+            cam_R, cam_T, keyframe_info = result
+            return cam_R, cam_T, keyframe_info
+        else:
+            cam_R, cam_T = result
+            return cam_R, cam_T
     
     def align_to_world_frame(
         self,

@@ -5,6 +5,7 @@ from typing import Dict, Any, Optional, List, Union
 import numpy as np
 import torch
 import pickle
+import gzip
 import os
 from datetime import datetime
 
@@ -147,40 +148,81 @@ class PipelineData:
     
     # === 序列化方法 ===
     
-    def save(self, path: str):
-        """保存到文件"""
+    def save(self, path: str, incremental: bool = False, previous_stage: str = ""):
+        """保存到文件
+        
+        Args:
+            path: 保存路径
+            incremental: 是否使用增量保存（只保存当前阶段新增/变更的字段）
+            previous_stage: 上一阶段的名称（增量保存时用于确定哪些字段是新增的）
+        """
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
         
-        # 转换为可序列化格式
+        # 根据当前阶段确定哪些字段需要保存
+        # 基础字段（很小，始终保存）
         data = {
+            '_version': 2,  # 标记新格式
+            '_incremental': incremental,
             'sequence_name': self.sequence_name,
             'sequence_path': self.sequence_path,
             'image_paths': self.image_paths,
-            'bboxes': self.bboxes,
-            'masks': self.masks.cpu().numpy() if isinstance(self.masks, torch.Tensor) else self.masks,
-            'tracks': self.tracks,
-            'camera_params': self.camera_params.to_dict() if self.camera_params else None,
-            'gt_camera_params': self.gt_camera_params.to_dict() if self.gt_camera_params else None,
-            'smpl_params': self.smpl_params.to_dict() if self.smpl_params else None,
-            'gt_smpl_params': self.gt_smpl_params.to_dict() if self.gt_smpl_params else None,
-            'annotations': self.annotations,
-            'valid_frames_mask': self.valid_frames_mask,
-            'metrics': self.metrics,
-            'metadata': self.metadata,
             'current_stage': self.current_stage,
             'iteration': self.iteration,
+            'metrics': self.metrics,
+            'metadata': self.metadata,
+            'valid_frames_mask': self.valid_frames_mask,
         }
         
+        # 不保存 annotations（缓存加载时不使用，且体积较大）
         # 不保存原始图像数据（太大）
         
-        with open(path, 'wb') as f:
-            pickle.dump(data, f)
+        if incremental:
+            # 增量模式：只保存当前阶段新增/变更的字段
+            stage = self.current_stage.lower()
+            
+            if 'detection' in stage:
+                data['bboxes'] = self.bboxes
+            elif 'segmentation' in stage:
+                data['masks'] = self.masks.cpu().numpy() if isinstance(self.masks, torch.Tensor) else self.masks
+            elif 'camera' in stage or 'slam' in stage:
+                data['camera_params'] = self.camera_params.to_dict() if self.camera_params else None
+                data['gt_camera_params'] = self.gt_camera_params.to_dict() if self.gt_camera_params else None
+            elif 'hpe' in stage:
+                data['smpl_params'] = self.smpl_params.to_dict() if self.smpl_params else None
+                data['gt_smpl_params'] = self.gt_smpl_params.to_dict() if self.gt_smpl_params else None
+            else:
+                # 未知阶段，保存所有字段（安全回退）
+                data['bboxes'] = self.bboxes
+                data['masks'] = self.masks.cpu().numpy() if isinstance(self.masks, torch.Tensor) else self.masks
+                data['tracks'] = self.tracks
+                data['camera_params'] = self.camera_params.to_dict() if self.camera_params else None
+                data['gt_camera_params'] = self.gt_camera_params.to_dict() if self.gt_camera_params else None
+                data['smpl_params'] = self.smpl_params.to_dict() if self.smpl_params else None
+                data['gt_smpl_params'] = self.gt_smpl_params.to_dict() if self.gt_smpl_params else None
+        else:
+            # 完整模式：保存所有字段（向后兼容）
+            data['bboxes'] = self.bboxes
+            data['masks'] = self.masks.cpu().numpy() if isinstance(self.masks, torch.Tensor) else self.masks
+            data['tracks'] = self.tracks
+            data['camera_params'] = self.camera_params.to_dict() if self.camera_params else None
+            data['gt_camera_params'] = self.gt_camera_params.to_dict() if self.gt_camera_params else None
+            data['smpl_params'] = self.smpl_params.to_dict() if self.smpl_params else None
+            data['gt_smpl_params'] = self.gt_smpl_params.to_dict() if self.gt_smpl_params else None
+        
+        # 使用 gzip 压缩保存，显著减少磁盘占用
+        with gzip.open(path, 'wb', compresslevel=4) as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
     
     @classmethod
     def load(cls, path: str) -> 'PipelineData':
-        """从文件加载"""
-        with open(path, 'rb') as f:
-            data = pickle.load(f)
+        """从文件加载（兼容新旧格式）"""
+        # 尝试用 gzip 打开（新格式），失败则用普通 pickle（旧格式）
+        try:
+            with gzip.open(path, 'rb') as f:
+                data = pickle.load(f)
+        except (gzip.BadGzipFile, OSError):
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
         
         # 重建数据结构
         pipeline_data = cls(
@@ -215,16 +257,16 @@ class PipelineData:
         
         prefix = f"{prefix}_" if prefix else ""
         
-        # 保存相机参数
+        # 保存相机参数（使用压缩格式）
         if self.camera_params:
-            np.savez(
+            np.savez_compressed(
                 os.path.join(output_dir, f'{prefix}camera.npz'),
                 **self.camera_params.to_dict()
             )
         
-        # 保存 SMPL 参数
+        # 保存 SMPL 参数（使用压缩格式）
         if self.smpl_params:
-            np.savez(
+            np.savez_compressed(
                 os.path.join(output_dir, f'{prefix}smpl.npz'),
                 **self.smpl_params.to_dict()
             )
@@ -235,8 +277,9 @@ class PipelineData:
             with open(os.path.join(output_dir, f'{prefix}metrics.json'), 'w') as f:
                 json.dump(self.metrics, f, indent=2)
         
-        # 保存 masks
-        if self.masks is not None:
+        # 保存 masks（不再在 intermediate 阶段单独保存，仅在最终输出时保存）
+        # 如果 prefix 为空（最终输出）才保存 masks
+        if not prefix and self.masks is not None:
             torch.save(self.masks, os.path.join(output_dir, f'{prefix}masks.pt'))
     
     def clone(self) -> 'PipelineData':

@@ -9,11 +9,11 @@ conda activate alignHMR
 
 # 设置参数
 CONFIG="configs/pipelines/emdb_basic.yaml"
-SEQ="09_outdoor_walk"
-PERSON="P0"
+SEQ="24_outdoor_long_walk"
+PERSON="P2"
 SPLIT=2
 DATASET_PATH="datasets/EMDB"
-GPU_ID=3
+GPU_ID=2
 
 # 设置 GPU
 export CUDA_VISIBLE_DEVICES=$GPU_ID

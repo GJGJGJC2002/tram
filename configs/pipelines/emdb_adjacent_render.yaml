@@ -62,7 +62,6 @@ components:
     name: adjacent_frame_rendering
     pre_dis: 20  # 相邻帧间隔，可以调整这个参数
     device: "cuda"  # 或 "cpu"
-    output_dir: "results/emdb_adjacent_render"
     save_gt: true  # 是否同时渲染GT
     render_gt_only: false  # 如果只想看GT，设为true
 

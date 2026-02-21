@@ -219,6 +219,12 @@ def main():
                        choices=['accurate', 'efficient'],
                        help='HPE estimation mode')
     
+    # 多 GPU 分片参数
+    parser.add_argument('--shard_id', type=int, default=None,
+                       help='Shard index for multi-GPU parallel (0-based)')
+    parser.add_argument('--num_shards', type=int, default=None,
+                       help='Total number of shards for multi-GPU parallel')
+    
     # 调试选项
     parser.add_argument('--debug', action='store_true',
                        help='Enable debug hooks')
@@ -276,6 +282,15 @@ def main():
     if len(sequences) == 0:
         logger.error('No sequences found matching the criteria!')
         return
+    
+    # 多 GPU 分片：只处理当前分片对应的序列子集
+    if args.shard_id is not None and args.num_shards is not None:
+        total = len(sequences)
+        shard_size = (total + args.num_shards - 1) // args.num_shards
+        start = args.shard_id * shard_size
+        end = min(start + shard_size, total)
+        sequences = sequences[start:end]
+        logger.info(f'Shard {args.shard_id}/{args.num_shards}: processing sequences [{start}:{end}] ({len(sequences)} seqs)')
     
     logger.info(f'Found {len(sequences)} sequence(s) to process:')
     for seq_path in sequences:

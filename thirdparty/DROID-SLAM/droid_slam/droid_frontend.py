@@ -32,6 +32,10 @@ class DroidFrontend:
         self.frontend_thresh = args.frontend_thresh
         self.frontend_radius = args.frontend_radius
 
+        # hook: keyframe event log
+        self.keyframe_log = []  # list of dicts
+        self._record_keyframes = False  # set True to enable
+
     def __update(self):
         """ add edges, perform update """
 
@@ -55,6 +59,17 @@ class DroidFrontend:
         d = self.video.distance([self.t1-3], [self.t1-2], beta=self.beta, bidirectional=True)
 
         if d.item() < self.keyframe_thresh:
+            # hook: record keyframe removal
+            if self._record_keyframes:
+                self.keyframe_log.append({
+                    'event': 'remove_keyframe',
+                    'keyframe_idx': self.t1 - 2,
+                    'distance': d.item(),
+                    'threshold': self.keyframe_thresh,
+                    'tstamp': self.video.tstamp[self.t1-2].item() if self.t1-2 >= 0 else -1,
+                    'edge_snapshot': self.graph.get_edge_snapshot(),
+                })
+
             self.graph.rm_keyframe(self.t1 - 2)
             
             with self.video.get_lock():
@@ -62,6 +77,17 @@ class DroidFrontend:
                 self.t1 -= 1
 
         else:
+            # hook: record keyframe kept
+            if self._record_keyframes:
+                self.keyframe_log.append({
+                    'event': 'keep_keyframe',
+                    'keyframe_idx': self.t1 - 2,
+                    'distance': d.item(),
+                    'threshold': self.keyframe_thresh,
+                    'tstamp': self.video.tstamp[self.t1-2].item() if self.t1-2 >= 0 else -1,
+                    'edge_snapshot': self.graph.get_edge_snapshot(),
+                })
+
             for itr in range(self.iters2):
                 self.graph.update(None, None, use_inactive=True)
 
@@ -77,6 +103,14 @@ class DroidFrontend:
 
         self.t0 = 0
         self.t1 = self.video.counter.value
+
+        # hook: record initialization
+        if self._record_keyframes:
+            self.keyframe_log.append({
+                'event': 'initialize',
+                't1': self.t1,
+                'warmup': self.warmup,
+            })
 
         self.graph.add_neighborhood_factors(self.t0, self.t1, r=3)
 

@@ -6,6 +6,8 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import cv2
+import json
+import os
 from PIL import Image
 from glob import glob
 from torchvision.transforms import Resize
@@ -24,7 +26,7 @@ except RuntimeError:
     pass
 
 
-def run_metric_slam(img_folder, masks=None, calib=None, is_static=False):
+def run_metric_slam(img_folder, masks=None, calib=None, is_static=False, return_keyframe_info=False):
     '''
     Input:
         img_folder: directory that contain image files 
@@ -32,6 +34,8 @@ def run_metric_slam(img_folder, masks=None, calib=None, is_static=False):
                If None, no masking applied during slam.
         calib: camera intrinsics [fx, fy, cx, cy]. 
                If None, will be naively estimated.
+        return_keyframe_info: if True, additionally return a dict with keyframe
+               timestamps, SE3 poses, and low-res disparities for warm start.
     '''
 
     imgfiles = sorted(glob(f'{img_folder}/*.jpg'))
@@ -41,13 +45,30 @@ def run_metric_slam(img_folder, masks=None, calib=None, is_static=False):
         pred_cam_t = torch.zeros([len(imgfiles), 3])
         pred_cam_r = torch.eye(3).expand(len(imgfiles), 3, 3)
 
+        if return_keyframe_info:
+            return pred_cam_r, pred_cam_t, None
         return pred_cam_r, pred_cam_t
 
     ##### Masked droid slam #####
     droid, traj = run_slam(img_folder, masks=masks, calib=calib)
+    if droid is None:
+        raise RuntimeError(
+            f"DROID-SLAM failed to initialize. No images found or processed in {img_folder}. "
+            f"Check that the directory contains .jpg files."
+        )
     n = droid.video.counter.value
     tstamp = droid.video.tstamp.cpu().int().numpy()[:n]
     disps = droid.video.disps_up.cpu().numpy()[:n]
+
+    # Extract keyframe info for warm start before deleting droid
+    keyframe_info = None
+    if return_keyframe_info:
+        keyframe_info = {
+            'keyframe_tstamps': tstamp.copy(),                          # [n] int array
+            'keyframe_poses_se3': droid.video.poses[:n].cpu().numpy(),  # [n, 7] SE3
+            'keyframe_disps': droid.video.disps[:n].cpu().numpy(),      # [n, h//8, w//8]
+        }
+
     del droid
     torch.cuda.empty_cache()
 
@@ -84,16 +105,25 @@ def run_metric_slam(img_folder, masks=None, calib=None, is_static=False):
         scale = est_scale_hybrid(slam_depth, pred_depth, msk=msk)
         scales_.append(scale)
     scale = np.median(scales_)
+
+    # 释放 ZoeDepth 模型
+    del model_zoe_n
+    del pred_depths
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     
     # convert to metric-scale camera extrinsics: R_wc, T_wc
     pred_cam_t = torch.tensor(traj[:, :3]) * scale
     pred_cam_q = torch.tensor(traj[:, 3:])
     pred_cam_r = quaternion_to_matrix(pred_cam_q[:,[3,0,1,2]])
 
+    if return_keyframe_info:
+        return pred_cam_r, pred_cam_t, keyframe_info
     return pred_cam_r, pred_cam_t
 
 
-def run_slam(imagedir, masks=None, calib=None, depth=None):
+def run_slam(imagedir, masks=None, calib=None, depth=None, record_debug=True):
     """ Maksed DROID-SLAM """
     droid = None
     if calib is None:
@@ -107,6 +137,8 @@ def run_slam(imagedir, masks=None, calib=None, depth=None):
         if droid is None:
             slam_args.image_size = [image.shape[2], image.shape[3]]
             droid = Droid(slam_args)
+            if record_debug:
+                droid.enable_recording(True)
         
         if masks is not None:
             img_msk = img_msks[t]
@@ -116,7 +148,29 @@ def run_slam(imagedir, masks=None, calib=None, depth=None):
         else:
             droid.track(t, image, intrinsics=intrinsics, depth=depth, mask=None)  
 
+    if droid is None:
+        return None, None
+
+    # save debug info before terminate (terminate deletes frontend)
+    debug_info = None
+    if record_debug:
+        debug_info = droid.get_debug_info()
+
     traj = droid.terminate(image_stream(imagedir, calib))
+
+    # save debug info to file
+    if debug_info is not None:
+        # add final keyframe tstamps after backend
+        n = droid.video.counter.value
+        debug_info['num_keyframes_after_backend'] = n
+        debug_info['keyframe_tstamps_after_backend'] = droid.video.tstamp.cpu().numpy()[:n].tolist()
+
+        debug_dir = os.path.join(imagedir, '..', 'droid_debug')
+        os.makedirs(debug_dir, exist_ok=True)
+        debug_path = os.path.join(debug_dir, 'droid_frontend_debug.json')
+        with open(debug_path, 'w') as f:
+            json.dump(debug_info, f, indent=2)
+        print(f"[DROID Debug] Saved frontend debug info to {debug_path}")
 
     return droid, traj
 

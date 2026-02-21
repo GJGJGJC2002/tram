@@ -376,13 +376,21 @@ class EvaluationComponent(Component):
         pred_camq = matrix_to_quaternion(pred_camr)
         pred_traj = torch.concat([pred_camt, pred_camq], dim=-1).numpy()
         
+        # 检查是否已经进行了尺度对齐
+        scale_aligned = data.metadata.get('scale_aligned_to_first_slam', False)
+        if scale_aligned:
+            self.logger.warning(
+                "Camera trajectory was scale-aligned to reference trajectory. "
+                "ATE and ATE_s metrics will be very similar because scale is pre-corrected."
+            )
+        
         metrics = {}
         
         # ATE with scale correction
         stats_slam, _, _ = eval_slam(pred_traj.copy(), cam_t, cam_q, correct_scale=True)
         metrics['ate'] = stats_slam['mean']
         
-        # ATE without scale correction
+        # ATE without scale correction  
         stats_metric, _, _ = eval_slam(pred_traj.copy(), cam_t, cam_q, correct_scale=False)
         metrics['ate_s'] = stats_metric['mean']
         

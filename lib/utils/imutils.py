@@ -56,7 +56,13 @@ def transform(pt, center, scale, res, invert=0, rot=0, asint=True):
         return new_pt[:2]+1
 
 def crop(img, center, scale, res, rot=0):
-    """Crop image according to the supplied bounding box."""
+    """Crop image according to the supplied bounding box with safety checks."""
+    # 防御性检查：确保 scale 有效
+    if np.isnan(scale) or np.isinf(scale) or scale <= 0:
+        import warnings
+        warnings.warn(f"crop: Invalid scale={scale}, using default scale=1.0")
+        scale = 1.0
+    
     # Upper left point
     ul = np.array(transform([1, 1], center, scale, res, invert=1))-1
     # Bottom right point
@@ -70,6 +76,16 @@ def crop(img, center, scale, res, rot=0):
         br += pad
 
     new_shape = [br[1] - ul[1], br[0] - ul[0]]
+    
+    # 防御性检查：确保 new_shape 有效
+    if new_shape[0] <= 0 or new_shape[1] <= 0:
+        import warnings
+        warnings.warn(f"crop: Invalid new_shape={new_shape}, returning zeros")
+        if len(img.shape) > 2:
+            return np.zeros((res[0], res[1], img.shape[2]))
+        else:
+            return np.zeros(res)
+    
     if len(img.shape) > 2:
         new_shape += [img.shape[2]]
     new_img = np.zeros(new_shape)
@@ -228,13 +244,32 @@ def crop_img(img, center, scale, res, val=255):
 
 
 def boxes_2_cs(boxes):
+    """将 bboxes 转换为 center 和 scale
+    
+    Args:
+        boxes: [N, 4+] numpy array, (x1, y1, x2, y2, ...)
+    
+    Returns:
+        centers: [N, 2] numpy array
+        scales: [N] numpy array
+    """
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
     w, h = x2-x1, y2-y1
     cx, cy = x1+w/2, y1+h/2
     size = np.stack([w, h]).max(axis=0)
     
+    # 防御性检查：确保 size > 0，避免除零或 NaN
+    size = np.maximum(size, 1.0)  # 最小为 1 像素
+    
     centers = np.stack([cx, cy], axis=1)
     scales = size / 200
+    
+    # 额外检查：确保没有 NaN/Inf
+    if np.isnan(scales).any() or np.isinf(scales).any():
+        import warnings
+        warnings.warn(f"boxes_2_cs: Invalid scales detected (NaN/Inf), clamping to valid range")
+        scales = np.nan_to_num(scales, nan=0.5, posinf=10.0, neginf=0.1)
+    
     return centers, scales
 
 
