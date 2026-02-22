@@ -271,10 +271,60 @@ def _load_image_for_slam(imfile, calib):
     return image[None], intrinsics
 
 
+def _compute_background_texture_score(image_path, mask, blur_ksize=5):
+    """计算图像中非人体区域（背景）的纹理丰富程度。
+
+    使用 Laplacian 方差衡量纹理丰富度。值越高，纹理越丰富。
+
+    Args:
+        image_path: 原始图像路径
+        mask: 人体 mask (H, W)，>0 表示人体区域
+        blur_ksize: 高斯模糊核大小，用于去噪
+
+    Returns:
+        float: 背景区域的纹理得分（Laplacian 方差）
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return 0.0
+
+    # 对齐 mask 尺寸
+    if mask is not None:
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.cpu().numpy()
+        else:
+            mask_np = np.array(mask)
+        if mask_np.ndim == 3:
+            mask_np = mask_np[0]
+        if mask_np.shape[0] != img.shape[0] or mask_np.shape[1] != img.shape[1]:
+            mask_np = cv2.resize(mask_np.astype(np.float32), (img.shape[1], img.shape[0]))
+        bg_mask = mask_np < 0.5  # 背景区域
+    else:
+        bg_mask = np.ones_like(img, dtype=bool)
+
+    # 只在背景区域计算
+    bg_pixels = np.sum(bg_mask)
+    if bg_pixels < 100:
+        # 背景区域太小，无法可靠评估
+        return 0.0
+
+    # Laplacian 边缘检测
+    blurred = cv2.GaussianBlur(img, (blur_ksize, blur_ksize), 0)
+    laplacian = cv2.Laplacian(blurred, cv2.CV_64F)
+
+    # 只取背景区域的 Laplacian 方差
+    bg_laplacian = laplacian[bg_mask]
+    score = float(np.var(bg_laplacian))
+
+    return score
+
+
 def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
                        initial_disps=None, masks=None, calib=None,
                        depth=None, record_debug=True, original_imagedir=None,
-                       use_rendered_for_keyframes=False):
+                       use_rendered_for_keyframes=False,
+                       keyframe_render_mode='all',
+                       texture_threshold=500.0):
     """
     Run DROID-SLAM with forced keyframes and warm start initialization.
     
@@ -291,6 +341,14 @@ def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
         use_rendered_for_keyframes: if True, keyframes use rendered images from
             imagedir (with SMPL mesh), non-keyframes use original images + mask.
             If False, all frames use original images + mask (baseline behavior).
+        keyframe_render_mode: keyframe rendering strategy
+            - 'all': all keyframes use rendered images (original behavior)
+            - 'adaptive': per-keyframe decision based on background texture richness.
+              Keyframes with rich background texture use mask strategy (to preserve
+              background features), while keyframes with poor texture use rendered
+              images (SMPL mesh provides visual constraints).
+        texture_threshold: threshold for adaptive mode. Keyframes with background
+            texture score below this value use rendered images; above use mask.
     
     Returns:
         droid: WarmstartDroid object
@@ -316,6 +374,25 @@ def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
         print(f"[Warmstart] Keyframes use rendered images from {imagedir}")
         print(f"[Warmstart] Non-keyframes use original images from {original_imagedir}")
 
+    # Adaptive mode: pre-compute background texture scores for keyframes
+    adaptive_use_rendered = {}  # frame_idx -> bool
+    if use_rendered_for_keyframes and keyframe_render_mode == 'adaptive' and masks is not None:
+        print(f"[Warmstart] Adaptive mode: computing background texture scores (threshold={texture_threshold})...")
+        original_images = sorted(glob(os.path.join(base_imagedir, '*.jpg')))
+        num_rendered = 0
+        num_masked = 0
+        for kf_idx in sorted(forced_set):
+            if kf_idx < len(original_images) and kf_idx < len(masks):
+                score = _compute_background_texture_score(original_images[kf_idx], masks[kf_idx])
+                use_render = score < texture_threshold
+                adaptive_use_rendered[kf_idx] = use_render
+                if use_render:
+                    num_rendered += 1
+                else:
+                    num_masked += 1
+                print(f"  Keyframe {kf_idx}: texture_score={score:.1f} -> {'RENDERED (low texture)' if use_render else 'MASKED (rich texture)'}")
+        print(f"[Warmstart] Adaptive summary: {num_rendered} keyframes use rendered, {num_masked} use mask")
+
     for (t, image, intrinsics) in tqdm(image_stream(base_imagedir, calib)):
         if droid is None:
             slam_args.image_size = [image.shape[2], image.shape[3]]
@@ -330,7 +407,17 @@ def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
 
         # Decide which image to use for this frame
         is_keyframe = int(t) in forced_set
+
+        # Determine if this keyframe should use rendered image
+        should_use_rendered = False
         if use_rendered_for_keyframes and is_keyframe and rendered_image_list is not None:
+            if keyframe_render_mode == 'adaptive':
+                should_use_rendered = adaptive_use_rendered.get(int(t), False)
+            else:
+                # 'all' mode: all keyframes use rendered images
+                should_use_rendered = True
+
+        if should_use_rendered:
             # Keyframe: use rendered image (with SMPL mesh from adjacent_smpl/)
             if t < len(rendered_image_list):
                 rendered_image, _ = _load_image_for_slam(rendered_image_list[t], calib)
@@ -346,7 +433,7 @@ def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
             else:
                 droid.track(t, track_image, intrinsics=intrinsics, depth=depth, mask=None)
         else:
-            # Non-keyframe (or baseline mode): use original image + mask
+            # Non-keyframe (or baseline/adaptive-masked keyframe): use original image + mask
             if masks is not None:
                 img_msk = img_msks[t]
                 conf_msk = conf_msks[t]
@@ -374,6 +461,12 @@ def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
         debug_info['warmstart'] = True
         debug_info['forced_keyframes'] = sorted(list(forced_set))
         debug_info['use_rendered_for_keyframes'] = use_rendered_for_keyframes
+        debug_info['keyframe_render_mode'] = keyframe_render_mode
+        if keyframe_render_mode == 'adaptive':
+            debug_info['texture_threshold'] = texture_threshold
+            debug_info['adaptive_decisions'] = {
+                str(k): 'rendered' if v else 'masked' for k, v in adaptive_use_rendered.items()
+            }
 
         debug_dir = os.path.join(imagedir, '..', 'droid_debug')
         os.makedirs(debug_dir, exist_ok=True)
@@ -388,7 +481,9 @@ def run_slam_warmstart(imagedir, forced_keyframes, initial_poses_se3=None,
 def run_metric_slam_warmstart(img_folder, forced_keyframes, initial_poses_se3=None,
                               initial_disps=None, masks=None, calib=None,
                               is_static=False, original_image_dir=None,
-                              use_rendered_for_keyframes=False):
+                              use_rendered_for_keyframes=False,
+                              keyframe_render_mode='all',
+                              texture_threshold=500.0):
     """
     Run metric-scale SLAM with forced keyframes and warm start.
     
@@ -405,6 +500,8 @@ def run_metric_slam_warmstart(img_folder, forced_keyframes, initial_poses_se3=No
         original_image_dir: directory containing original images
         use_rendered_for_keyframes: if True, keyframes use rendered images,
             non-keyframes use original images + mask
+        keyframe_render_mode: 'all' or 'adaptive' (see run_slam_warmstart)
+        texture_threshold: threshold for adaptive mode
     
     Returns:
         pred_cam_r: rotation matrices [N, 3, 3]
@@ -433,6 +530,8 @@ def run_metric_slam_warmstart(img_folder, forced_keyframes, initial_poses_se3=No
         calib=calib,
         original_imagedir=original_image_dir,
         use_rendered_for_keyframes=use_rendered_for_keyframes,
+        keyframe_render_mode=keyframe_render_mode,
+        texture_threshold=texture_threshold,
     )
 
     if droid is None:

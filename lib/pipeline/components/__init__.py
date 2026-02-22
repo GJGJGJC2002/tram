@@ -6,6 +6,7 @@ from .slam import SLAMComponent
 from .hpe import HPEComponent
 from .evaluation import EvaluationComponent
 from .adjacent_smpl_renderer import AdjacentSMPLRenderer
+from .skating_removal import SkatingRemovalComponent
 
 __all__ = [
     'DetectionComponent',
@@ -14,6 +15,7 @@ __all__ = [
     'HPEComponent',
     'EvaluationComponent',
     'AdjacentSMPLRenderer',
+    'SkatingRemovalComponent',
 ]
 
 

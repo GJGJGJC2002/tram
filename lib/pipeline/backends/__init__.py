@@ -3,13 +3,14 @@
 from .detection import VitDetBackend
 from .segmentation import SAMBackend
 from .slam import DroidSLAMBackend
-from .hpe import VIMOBackend
+from .hpe import VIMOBackend, GVHMRBackend
 
 __all__ = [
     'VitDetBackend',
     'SAMBackend',
     'DroidSLAMBackend',
     'VIMOBackend',
+    'GVHMRBackend',
 ]
 
 

@@ -14,7 +14,7 @@ SEQ="09_outdoor_walk"
 PERSON="P0"
 SPLIT=2
 DATASET_PATH="datasets/EMDB"
-GPU_ID=0
+GPU_ID=1
 
 # 设置 GPU
 export CUDA_VISIBLE_DEVICES=$GPU_ID

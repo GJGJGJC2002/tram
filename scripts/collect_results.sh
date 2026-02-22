@@ -8,7 +8,7 @@
 #   bash scripts/collect_results.sh results/emdb_basic
 
 
-OUTPUT_DIR=results/emdb_adjacent_render_gt
+OUTPUT_DIR=results/emdb_adjacent_render_gt_keyframe
 
 echo "从 ${OUTPUT_DIR} 收集评估结果..."
 python lib/utils/collect_evaluation_results.py --output_dir ${OUTPUT_DIR}

@@ -8,7 +8,7 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate alignHMR
 
 # 设置参数
-CONFIG="configs/pipelines/emdb_adjacent_render_tram.yaml"
+CONFIG="configs/pipelines/gvhmr_base.yaml"
 SEQ="24_outdoor_long_walk"
 PERSON="P2"
 SPLIT=2

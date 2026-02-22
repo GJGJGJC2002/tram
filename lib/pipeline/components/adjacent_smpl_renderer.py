@@ -4,12 +4,15 @@ AdjacentSMPLRenderer - 渲染相邻帧SMPL mesh的组件
 这个组件复现adjTram的功能，对每一帧渲染当前帧、前x帧、后x帧的SMPL mesh，
 并将它们在当前帧的相机视角下拼接显示。
 
-支持两种渲染模式（render_mode）：
+支持三种渲染模式（render_mode）：
 - 'camera'（默认，适合 TRAM）: 使用相机坐标系的 trans (local_trans) 生成
   vertices，再通过 c2w 做帧间相对变换。适合 VIMO 等估计方法产生的相机坐标系参数。
 - 'world'（适合 GT）: 直接使用世界坐标系的 trans (global_trans) + 世界坐标系
   root orientation 生成 vertices，再用 GT 的 w2c 投影到当前帧。避免了两种方法
   对世界坐标系 Y 轴约定不同导致的渲染偏移问题。
+- 'gvhmr_world'（适合 GVHMR）: 从 GVHMR 的 global+incam 两套输出反推每帧
+  T_w2c 变换矩阵，用修正后的全局 vertices 投影到当前帧相机视角下。
+  完全不需要外部 SLAM 的相机参数。
 """
 
 import os
@@ -49,9 +52,12 @@ class AdjacentSMPLRenderer(Component):
         'num_adjacent_frames': 1,  # 前后渲染的帧数（渲染 i-x*pre_dis 到 i+x*pre_dis）
         'device': 'cpu',
         'output_dir': 'results/adjacent_smpl',
-        'render_mode': 'camera',  # 'camera' (TRAM) 或 'world' (GT)
+        'render_mode': 'camera',  # 'camera' (TRAM), 'world' (GT), 'gvhmr_world' (GVHMR)
         'frame_selection_mode': 'uniform',  # 'uniform' (均匀 pre_dis 采样) 或 'keyframe' (使用 SLAM 关键帧)
         'render_only_keyframes': False,  # keyframe 模式下是否只渲染关键帧（跳过非关键帧以节省时间）
+        'mesh_color_mode': 'colorful',  # 'colorful' (每帧不同彩色) 或 'uniform' (统一灰白色)
+        'uniform_mesh_color': [0.75, 0.75, 0.75],  # mesh_color_mode='uniform' 时使用的 RGB 颜色 [0-1]
+        'gvhmr_root': 'thirdparty/GVHMR',  # gvhmr_world 模式需要的 GVHMR 根目录
     }
 
     def __init__(self, name: str, config: Dict[str, Any] = None):
@@ -65,6 +71,9 @@ class AdjacentSMPLRenderer(Component):
         self.render_mode = self.config['render_mode']
         self.frame_selection_mode = self.config['frame_selection_mode']
         self.render_only_keyframes = self.config['render_only_keyframes']
+        self.mesh_color_mode = self.config['mesh_color_mode']
+        self.uniform_mesh_color = self.config['uniform_mesh_color']
+        self.gvhmr_root = self.config.get('gvhmr_root', 'thirdparty/GVHMR')
 
         # SMPL模型和faces
         self.smpl_model = None
@@ -104,6 +113,17 @@ class AdjacentSMPLRenderer(Component):
 
         return colors
 
+    def _get_mesh_color(self, frame_idx: int):
+        """根据 mesh_color_mode 配置获取渲染颜色
+
+        Returns:
+            RGB color as list, each in [0, 1] range
+        """
+        if self.mesh_color_mode == 'uniform':
+            return self.uniform_mesh_color
+        else:
+            return self.frame_colors[frame_idx]
+
     def validate_input(self, data: PipelineData) -> bool:
         """验证输入"""
         # 需要SMPL参数
@@ -118,7 +138,14 @@ class AdjacentSMPLRenderer(Component):
             self.logger.warning("No image paths found in data")
             return False
 
-        # 需要相机参数（优先从 data.camera_params，其次从 annotations）
+        # gvhmr_world 模式不需要外部 camera_params（自行从 GVHMR 输出反推）
+        if self.render_mode == 'gvhmr_world':
+            if data.smpl_params.global_orient_w is None or data.smpl_params.global_orient_c is None:
+                self.logger.warning("gvhmr_world mode requires GVHMR fields in smpl_params")
+                return False
+            return True
+
+        # 其他模式需要相机参数
         if data.camera_params is None:
             self.logger.warning("No camera_params found in data")
             return False
@@ -175,6 +202,8 @@ class AdjacentSMPLRenderer(Component):
         # 执行渲染
         if self.frame_selection_mode == 'keyframe':
             return self._execute_keyframe_mode(data)
+        elif self.render_mode == 'gvhmr_world':
+            return self._execute_gvhmr_world_mode(data)
         elif self.render_mode == 'world':
             return self._execute_world_mode(data)
         else:
@@ -281,7 +310,7 @@ class AdjacentSMPLRenderer(Component):
                         verts_world = torch.einsum('ij,vj->vi', R_c2w_j, verts_j) + t_c2w_j
                         verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_world) + t_w2c_i
 
-                    final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self.frame_colors[frame_idx])
+                    final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx))
 
             output_path = os.path.join(output_dir, img_name)
             cv2.imwrite(output_path, final_img)
@@ -404,7 +433,129 @@ class AdjacentSMPLRenderer(Component):
                     # 世界坐标系 -> 当前帧相机坐标系: p_cam = R_w2c @ p_world + t_w2c
                     verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_w) + t_w2c_i
 
-                    final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self.frame_colors[frame_idx])
+                    final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx))
+
+            output_path = os.path.join(output_dir, img_name)
+            cv2.imwrite(output_path, final_img)
+
+        self._log_render_summary(rendered_indices, N, last_frame_saved, output_dir)
+        self._save_render_info(data, N, rendered_indices, last_frame_saved, output_dir)
+
+        return data
+
+    def _execute_gvhmr_world_mode(self, data: PipelineData) -> PipelineData:
+        """GVHMR 世界坐标系模式渲染
+
+        策略：从 GVHMR 的 global+incam 两套输出反推每帧的 T_w2c（世界到相机的变换矩阵），
+        使用修正后（滑步消除后）的全局 SMPL 参数生成世界坐标系下的 vertices，
+        再用原始的 T_w2c 投影到中心帧的相机视角下渲染。
+
+        关键公式（来自 GVHMR 的 get_T_w2c_from_wcparams）：
+            R_w2c = R_c @ R_w^T
+            t_w2c = t_c + offset - R_w2c @ (t_w + offset)
+
+        注意：T_w2c 使用滑步修正前的 global 参数（transl_w_raw）反推，
+        因为 incam 参数未被修正，这样才能保证 T_w2c 的精确性。
+        渲染时使用修正后的全局 vertices。
+
+        完全不需要外部 SLAM 的相机参数。
+        """
+        import sys
+        from lib.vis.renderer import Renderer
+
+        gvhmr_abs = os.path.abspath(self.gvhmr_root)
+        if gvhmr_abs not in sys.path:
+            sys.path.insert(0, gvhmr_abs)
+        from hmr4d.utils.geo.hmr_global import get_T_w2c_from_wcparams
+
+        # 获取图像路径
+        if hasattr(data, 'image_paths'):
+            img_paths = data.image_paths
+        else:
+            img_paths = data.metadata.get('image_paths', [])
+
+        N = len(img_paths)
+        first_img = cv2.imread(img_paths[0])
+        H, W = first_img.shape[:2]
+
+        # 获取相机内参
+        intrinsics = self._get_intrinsics(data)
+        if intrinsics is None:
+            return data
+        focal_length = float(intrinsics[0, 0])
+
+        # 获取 GVHMR 参数
+        sp = data.smpl_params
+        if sp.global_orient_w is None or sp.global_orient_c is None:
+            self.logger.error(
+                "gvhmr_world mode requires GVHMR-specific fields in smpl_params "
+                "(global_orient_w, global_orient_c, etc.)"
+            )
+            return data
+
+        global_orient_w = sp.global_orient_w  # (F, 3) axis-angle
+        global_orient_c = sp.global_orient_c  # (F, 3) axis-angle
+        transl_w_raw = sp.transl_w_raw  # (F, 3) 滑步修正前的 world transl
+        transl_c = sp.trans  # (F, 3) incam transl
+        skeleton_offset = sp.skeleton_offset  # (3,) root joint offset
+
+        # 修正后的参数（经过 SkatingRemoval）
+        transl_w_fixed = sp.global_trans  # (F, 3) 修正后的 world transl
+        body_pose_fixed = sp.body_pose_aa  # (F, 63) 修正后的 body pose
+        betas = sp.betas  # (F, 10)
+
+        # 确保在正确的 device 上
+        device = torch.device(self.device)
+
+        # --- 1. 反推 T_w2c（使用原始的 global 参数 + incam 参数） ---
+        T_w2c = get_T_w2c_from_wcparams(
+            global_orient_w.to(device),
+            transl_w_raw.to(device),
+            global_orient_c.to(device),
+            transl_c.to(device),
+            skeleton_offset.to(device),
+        )  # (F, 4, 4)
+
+        self.logger.info(f"[gvhmr_world mode] Computed T_w2c: {T_w2c.shape}")
+
+        R_w2c = T_w2c[:, :3, :3].cpu().numpy()  # (F, 3, 3)
+        t_w2c = T_w2c[:, :3, 3].cpu().numpy()  # (F, 3)
+
+        # --- 2. 使用修正后的全局参数生成世界坐标系下的 vertices ---
+        vertices_world = self._generate_vertices_gvhmr(
+            global_orient_w, body_pose_fixed, betas, transl_w_fixed
+        )
+        self.logger.info(f"Generated vertices: {vertices_world.shape} (world coords, post-correction)")
+
+        # --- 3. 渲染 ---
+        render = Renderer(W, H, focal_length, self.device, self.smpl_faces)
+        self.frame_colors = self._generate_frame_colors(N)
+        output_dir = self._get_output_dir(data)
+        rendered_indices = list(range(0, N, self.pre_dis))
+        last_frame_saved = self._save_last_frame_if_needed(img_paths, rendered_indices, N, output_dir)
+
+        self.logger.info(f"Rendering {len(rendered_indices)} frames (every {self.pre_dis}th frame)...")
+
+        for i in tqdm(rendered_indices, desc="Rendering adjacent frames (gvhmr_world mode)"):
+            img = cv2.imread(img_paths[i])
+            final_img = img.copy()
+            img_name = os.path.basename(img_paths[i])
+
+            # 当前帧的 w2c
+            R_w2c_i = torch.from_numpy(R_w2c[i]).float().to(self.device)
+            t_w2c_i = torch.from_numpy(t_w2c[i]).float().to(self.device)
+
+            for offset in range(-self.num_adjacent_frames * self.pre_dis,
+                                self.num_adjacent_frames * self.pre_dis + 1,
+                                self.pre_dis):
+                frame_idx = i + offset
+                if 0 <= frame_idx < N:
+                    verts_w = torch.tensor(vertices_world[frame_idx]).float().to(self.device)
+                    # world -> cam_i: p_cam = R_w2c_i @ p_world + t_w2c_i
+                    verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_w) + t_w2c_i
+                    final_img = render.render_mesh(
+                        verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx)
+                    )
 
             output_path = os.path.join(output_dir, img_name)
             cv2.imwrite(output_path, final_img)
@@ -524,7 +675,7 @@ class AdjacentSMPLRenderer(Component):
                             verts_world = torch.einsum('ij,vj->vi', R_c2w_j, verts) + t_c2w_j
                             verts_in_cam = torch.einsum('ij,vj->vi', R_w2c_i, verts_world) + t_w2c_i
 
-                    final_img = render.render_mesh(verts_in_cam, final_img, colors=self.frame_colors[frame_idx])
+                    final_img = render.render_mesh(verts_in_cam, final_img, colors=self._get_mesh_color(frame_idx))
             else:
                 # 非关键帧（仅当 render_only=False 时才会进入此分支）
                 if masks is not None:
@@ -749,6 +900,57 @@ class AdjacentSMPLRenderer(Component):
                 body_pose=poses_body_t,
                 betas=betas_t,
                 transl=trans_t,
+                pose2rot=True,
+            )
+
+            vertices = smpl_output.vertices
+
+        return vertices.cpu().numpy()
+
+    def _generate_vertices_gvhmr(self, global_orient_aa, body_pose_aa, betas, transl):
+        """从 GVHMR 的 axis-angle 参数生成 vertices（gvhmr_world mode 使用）
+
+        GVHMR 输出的 global_orient 和 body_pose 都是 axis-angle 格式。
+        SMPL 模型需要：
+          - global_orient: (F, 3) axis-angle
+          - body_pose: (F, 69) 或 (F, 23*3) axis-angle
+          - betas: (F, 10)
+          - transl: (F, 3)
+
+        注意：GVHMR 的 body_pose 是 (F, 63)，即 21 个关节。
+        pipeline 中使用的 SMPL 模型期望 23 个关节 (69 维)。
+        需要做 zero-padding。
+
+        Args:
+            global_orient_aa: (F, 3) axis-angle，世界坐标系 root orientation
+            body_pose_aa: (F, 63) axis-angle，body pose（GVHMR: 21 joints）
+            betas: (F, 10) shape
+            transl: (F, 3) world translation（修正后）
+        """
+        with torch.no_grad():
+            def to_tensor(x):
+                if isinstance(x, np.ndarray):
+                    return torch.from_numpy(x).float().to(self.device)
+                return x.float().to(self.device)
+
+            global_orient_t = to_tensor(global_orient_aa)  # (F, 3)
+            body_pose_t = to_tensor(body_pose_aa)  # (F, 63)
+            betas_t = to_tensor(betas)  # (F, 10)
+            transl_t = to_tensor(transl)  # (F, 3)
+
+            F_len = global_orient_t.shape[0]
+
+            # GVHMR body_pose 是 21 joints (63 dim)
+            # SMPL 模型期望 23 joints (69 dim)，补 2 个零关节
+            if body_pose_t.shape[-1] == 63:
+                padding = torch.zeros(F_len, 6, device=self.device)
+                body_pose_t = torch.cat([body_pose_t, padding], dim=-1)  # (F, 69)
+
+            smpl_output = self.smpl_model(
+                global_orient=global_orient_t,
+                body_pose=body_pose_t,
+                betas=betas_t,
+                transl=transl_t,
                 pose2rot=True,
             )
 

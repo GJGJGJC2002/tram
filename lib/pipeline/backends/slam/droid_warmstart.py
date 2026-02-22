@@ -54,6 +54,8 @@ class DroidWarmstartBackend(Backend):
         is_static: bool = False,
         original_image_dir: str = None,
         use_rendered_for_keyframes: bool = False,
+        keyframe_render_mode: str = 'all',
+        texture_threshold: float = 500.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         使用 warm start 运行 DROID-SLAM
@@ -68,6 +70,8 @@ class DroidWarmstartBackend(Backend):
             is_static: 是否为静态相机
             original_image_dir: 原始图像目录
             use_rendered_for_keyframes: 关键帧是否使用渲染图像
+            keyframe_render_mode: 'all' (所有关键帧用渲染) 或 'adaptive' (根据纹理自适应)
+            texture_threshold: adaptive 模式的纹理阈值
 
         Returns:
             cam_R: 旋转矩阵 [N_total, 3, 3]
@@ -82,6 +86,9 @@ class DroidWarmstartBackend(Backend):
         self.logger.info(f"  Forced keyframes: {len(forced_keyframes)}")
         self.logger.info(f"  Warm start poses: {len(initial_poses_se3) if initial_poses_se3 else 0}")
         self.logger.info(f"  Use rendered for keyframes: {use_rendered_for_keyframes}")
+        self.logger.info(f"  Keyframe render mode: {keyframe_render_mode}")
+        if keyframe_render_mode == 'adaptive':
+            self.logger.info(f"  Texture threshold: {texture_threshold}")
         if original_image_dir:
             self.logger.info(f"  Original image source: {original_image_dir}")
 
@@ -97,6 +104,8 @@ class DroidWarmstartBackend(Backend):
             is_static=is_static,
             original_image_dir=original_image_dir,
             use_rendered_for_keyframes=use_rendered_for_keyframes,
+            keyframe_render_mode=keyframe_render_mode,
+            texture_threshold=texture_threshold,
         )
 
         self.logger.info(f"Warmstart SLAM output: R={cam_R.shape}, T={cam_T.shape}")

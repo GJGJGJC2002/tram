@@ -1,0 +1,128 @@
+# GVHMR Base Pipeline
+# 使用 GVHMR 作为人体运动估计后端，不依赖外部 SLAM 的相机参数
+#
+# Pipeline 流程：
+#   1. Detection (VitDet) - 人体检测
+#   2. Segmentation (SAM) - 人体分割
+#   3. HPE (GVHMR) - GVHMR 推理（输出 global + incam 两套参数）
+#   4. SkatingRemoval - 滑步消除（pp_static_joint + IK）
+#   5. AdjacentSMPLRenderer (gvhmr_world) - 用 GVHMR 自带的 T_w2c 渲染邻帧 SMPL
+#   6. SLAM (droid_tiaozhen) - 在渲染后图像上运行 DROID-SLAM
+#   7. Evaluation - 评估指标
+#
+# 关键设计：
+# - GVHMR 同时输出 global 和 incam 参数，通过 get_T_w2c_from_wcparams
+#   反推每帧的完整 w2c 变换矩阵，完全不需要第一次 SLAM
+# - 滑步消除使用原始 global 参数和 static_conf_logits
+# - 渲染使用修正后的 global vertices + 原始反推的 T_w2c
+# - 重叠窗口策略：pre_dis=5, num_adjacent_frames=1 使每两个中心帧共享重叠帧
+
+name: "GVHMR Base Pipeline"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/gvhmr_base"
+
+components:
+  # 1. Human Detection
+  - type: detection
+    name: human_detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+    max_detections: 10
+    arrange_mode: size
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. Human Segmentation
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 3. GVHMR Preprocessing (HPE)
+  # 只做推理，输出原始的 smpl_params_global + smpl_params_incam + static_conf_logits
+  - type: hpe
+    name: gvhmr_preprocessing
+    backend: gvhmr
+    gvhmr_root: "thirdparty/GVHMR"
+    static_cam: false
+    f_mm: null  # null = 自动估计焦距
+    vo_method: "sift"  # GVHMR 内部的轻量级 VO（仅用于相机旋转角速度估计）
+    use_mean_shape: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 4. Skating Removal (后处理)
+  # pp_static_joint: 基于静止关节检测修正全局平移
+  # process_ik: 反向运动学修正 body_pose
+  - type: skating_removal
+    name: skating_removal
+    gvhmr_root: "thirdparty/GVHMR"
+    enable_static_joint: true
+    enable_ik: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 5. Adjacent Frame SMPL Rendering (gvhmr_world mode)
+  # 从 GVHMR 的 global+incam 反推 T_w2c，用修正后的全局 vertices 渲染
+  # 重叠窗口：pre_dis=5 使相邻中心帧共享帧，确保 SLAM 可以做帧间匹配
+  - type: adjacent_smpl_renderer
+    name: adjacent_frame_rendering
+    pre_dis: 5
+    num_adjacent_frames: 1
+    device: "cuda"
+    render_mode: "gvhmr_world"
+    frame_selection_mode: "uniform"
+    mesh_color_mode: "uniform"
+    uniform_mesh_color: [0.75, 0.75, 0.75]
+    gvhmr_root: "thirdparty/GVHMR"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 6. SLAM on Rendered Images
+  # 在渲染后的图像上运行 DROID-SLAM，获取全局相机参数
+  - type: slam
+    name: camera_estimation
+    backend: droid_tiaozhen
+    use_masks: true
+    align_to_world: true
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 7. Evaluation
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_camera_estimation'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: true

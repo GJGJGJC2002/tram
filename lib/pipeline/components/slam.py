@@ -313,7 +313,10 @@ class SLAMComponent(BackendComponent):
 
         # 是否在关键帧上使用渲染图像（带 SMPL mesh）
         use_rendered_for_keyframes = self.config.get('use_rendered_for_keyframes', False)
+        keyframe_render_mode = self.config.get('keyframe_render_mode', 'all')
+        texture_threshold = self.config.get('texture_threshold', 500.0)
         self.logger.info(f"  Use rendered for keyframes: {use_rendered_for_keyframes}")
+        self.logger.info(f"  Keyframe render mode: {keyframe_render_mode}")
 
         # 运行 warmstart SLAM
         cam_R, cam_T = self.backend.estimate_camera(
@@ -325,6 +328,8 @@ class SLAMComponent(BackendComponent):
             intrinsics=intrinsics,
             original_image_dir=original_image_dir,
             use_rendered_for_keyframes=use_rendered_for_keyframes,
+            keyframe_render_mode=keyframe_render_mode,
+            texture_threshold=texture_threshold,
         )
 
         # 尺度对齐

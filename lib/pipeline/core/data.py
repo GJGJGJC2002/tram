@@ -50,6 +50,13 @@ class SMPLParams:
     pred_cam: Optional[Union[np.ndarray, torch.Tensor]] = None  # 预测的相机参数
     vertices: Optional[Union[np.ndarray, torch.Tensor]] = None  # 顶点
     joints: Optional[Union[np.ndarray, torch.Tensor]] = None  # 关节点
+    # GVHMR 特有字段
+    global_orient_w: Optional[Union[np.ndarray, torch.Tensor]] = None  # 世界坐标系 root orient (F, 3) axis-angle
+    global_orient_c: Optional[Union[np.ndarray, torch.Tensor]] = None  # 相机坐标系 root orient (F, 3) axis-angle
+    body_pose_aa: Optional[Union[np.ndarray, torch.Tensor]] = None  # body pose (F, 63) axis-angle
+    transl_w_raw: Optional[Union[np.ndarray, torch.Tensor]] = None  # 滑步修正前的 world transl (F, 3)
+    static_conf_logits: Optional[Union[np.ndarray, torch.Tensor]] = None  # 静止置信度 logits (F, J)
+    skeleton_offset: Optional[Union[np.ndarray, torch.Tensor]] = None  # SMPL skeleton root offset (3,)
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""

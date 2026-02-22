@@ -14,6 +14,7 @@ from .components import (
     HPEComponent,
     EvaluationComponent,
     AdjacentSMPLRenderer,
+    SkatingRemovalComponent,
 )
 
 
@@ -49,6 +50,7 @@ class PipelineBuilder:
         'hpe': HPEComponent,
         'evaluation': EvaluationComponent,
         'adjacent_smpl_renderer': AdjacentSMPLRenderer,
+        'skating_removal': SkatingRemovalComponent,
     }
     
     @classmethod

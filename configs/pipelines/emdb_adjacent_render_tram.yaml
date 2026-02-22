@@ -55,7 +55,7 @@ components:
   # 5. Adjacent Frame SMPL Rendering
   - type: adjacent_smpl_renderer
     name: adjacent_frame_rendering
-    pre_dis: 1
+    pre_dis: 3
     num_adjacent_frames: 2
     device: "cuda"
 
@@ -63,7 +63,7 @@ components:
   - type: slam
     name: camera_estimation_tiaozhen
     backend: droid_tiaozhen
-    use_masks: false  # 不使用 mask，因为已经在渲染时去除了人体
+    use_masks: ture  # 不使用 mask，因为已经在渲染时去除了人体
     align_to_world: true
     image_dir: null  # 自动从 adjacent_render_info 中获取，拼接 sequence_name
     cache:

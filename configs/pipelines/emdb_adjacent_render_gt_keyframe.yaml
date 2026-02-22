@@ -42,21 +42,34 @@ components:
       use_cache: false
       overwrite: true  # 总是覆盖缓存，确保 keyframe_info 是最新的
 
-  # 4. GT SMPL Parameters Loading
+  # # 4. GT SMPL Parameters Loading
+  # - type: hpe
+  #   name: gt_smpl_loading
+  #   backend: gt
+  #   convert_to_rotmat: true
+  #   use_mean_shape: false
+
+  # 4. Human Pose Estimation (TRAM/VIMO)
   - type: hpe
-    name: gt_smpl_loading
-    backend: gt
-    convert_to_rotmat: true
-    use_mean_shape: false
+    name: hpe_estimation
+    backend: vimo
+    mode: accurate
+    use_mean_shape: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
 
   # 5. Adjacent Frame SMPL Rendering (keyframe 模式)
   - type: adjacent_smpl_renderer
     name: adjacent_frame_rendering
-    num_adjacent_frames: 8
+    num_adjacent_frames: 1
     device: "cuda"
     render_mode: "world"
     frame_selection_mode: "keyframe"  # 全帧输出：关键帧渲染邻居 SMPL，非关键帧 mask 去人
     render_only_keyframes: true  # 只渲染关键帧，跳过非关键帧以节省时间（配合 use_rendered_for_keyframes 使用）
+    mesh_color_mode: "colorful"  # 'colorful' (每帧不同彩色) 或 'uniform' (统一灰白色，减少颜色对匹配的干扰)
+    uniform_mesh_color: [0.75, 0.75, 0.75]  # uniform 模式下的 RGB 颜色 [0-1]
     cache:
       enabled: true
       use_cache: false  # 设为 true 时直接读取 adjacent_smpl 目录的图片
@@ -72,6 +85,8 @@ components:
     enable_scale_alignment: false
     use_warmstart_poses: false  # 不注入 warmstart poses
     use_rendered_for_keyframes: true  # 关键帧使用 adjacent_smpl/ 渲染图像（带 SMPL mesh）
+    keyframe_render_mode: "adaptive"  # 'all' (所有关键帧用渲染图像) 或 'adaptive' (根据背景纹理自适应选择)
+    texture_threshold: 30.0  # adaptive 模式阈值：背景纹理得分低于此值才用渲染图像，高于则用 mask 策略
     cache:
       enabled: true
       use_cache: false

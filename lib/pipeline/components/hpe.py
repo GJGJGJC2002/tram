@@ -7,6 +7,7 @@ import torch
 from lib.pipeline.core.component import BackendComponent
 from lib.pipeline.core.data import PipelineData, SMPLParams
 from lib.pipeline.backends.hpe import VIMOBackend, GTSmplBackend
+from lib.pipeline.backends.hpe.gvhmr import GVHMRBackend
 
 
 class HPEComponent(BackendComponent):
@@ -16,7 +17,7 @@ class HPEComponent(BackendComponent):
     从图像序列中估计 SMPL 人体模型参数。
     
     Config:
-        backend: HPE 后端类型 ('vimo', 'hmr', ...)
+        backend: HPE 后端类型 ('vimo', 'gt', 'gvhmr')
         mode: 估计模式 ('accurate', 'efficient')
         use_mean_shape: 是否使用平均形状参数
     """
@@ -26,6 +27,7 @@ class HPEComponent(BackendComponent):
     BACKENDS = {
         'vimo': VIMOBackend,
         'gt': GTSmplBackend,
+        'gvhmr': GVHMRBackend,
     }
     
     DEFAULT_BACKEND = 'vimo'
@@ -128,6 +130,8 @@ class HPEComponent(BackendComponent):
         # 根据后端类型调用不同的方法
         if self.backend_type == 'gt':
             return self._execute_gt(data)
+        elif self.backend_type == 'gvhmr':
+            return self._execute_gvhmr(data)
         else:
             return self._execute_vimo(data)
 
@@ -308,6 +312,95 @@ class HPEComponent(BackendComponent):
 
         return data
     
+    def _execute_gvhmr(self, data: PipelineData) -> PipelineData:
+        """使用 GVHMR 后端执行（只做推理，不做后处理）"""
+        # 帧采样（如果配置了跳帧）
+        self._sample_frames(data)
+
+        # 获取相机参数
+        img_focal, img_center = self._get_camera_params(data)
+
+        self.logger.info("Running GVHMR inference...")
+
+        # 调用 GVHMR 后端
+        gvhmr_results = self.backend.estimate_smpl(
+            image_paths=data.image_paths,
+            bboxes=data.bboxes,
+            img_focal=img_focal,
+            img_center=img_center,
+        )
+
+        # 解包 GVHMR 输出
+        smpl_global = gvhmr_results['smpl_params_global']
+        smpl_incam = gvhmr_results['smpl_params_incam']
+        static_conf_logits = gvhmr_results['static_conf_logits']  # (1, F, J) or (F, J)
+        skeleton_offset = gvhmr_results['skeleton_offset']  # (3,)
+
+        # 去掉 batch 维度 (GVHMR 输出通常有 batch=1)
+        def squeeze_batch(d):
+            return {k: v[0] if v.ndim > 0 and v.shape[0] == 1 and v.ndim >= 2 else v
+                    for k, v in d.items()}
+
+        # GVHMR 的 smpl_params_global: {global_orient: (F,3), body_pose: (F,63), betas: (F,10), transl: (F,3)}
+        global_orient_w = smpl_global['global_orient']  # (F, 3) axis-angle
+        body_pose_aa = smpl_global['body_pose']  # (F, 63)
+        betas = smpl_global['betas']  # (F, 10)
+        transl_w = smpl_global['transl']  # (F, 3)
+
+        global_orient_c = smpl_incam['global_orient']  # (F, 3)
+        transl_c = smpl_incam['transl']  # (F, 3)
+
+        # 处理 static_conf_logits 维度
+        if static_conf_logits.ndim == 3:
+            static_conf_logits = static_conf_logits[0]  # (F, J)
+
+        # 使用平均 shape
+        if self.use_mean_shape:
+            mean_betas = betas.mean(dim=0, keepdim=True)
+            betas = mean_betas.repeat(len(betas), 1)
+
+        num_frames = len(global_orient_w)
+        self.logger.info(
+            f"GVHMR output: {num_frames} frames, "
+            f"global_orient_w: {global_orient_w.shape}, "
+            f"body_pose: {body_pose_aa.shape}, "
+            f"betas: {betas.shape}"
+        )
+
+        # 创建 SMPL 参数对象（存储 GVHMR 原始输出）
+        data.smpl_params = SMPLParams(
+            # 标准字段
+            betas=betas,
+            trans=transl_c,  # 相机坐标系平移（incam）
+            global_trans=transl_w.clone(),  # 世界坐标系平移（初始 = raw）
+            # GVHMR 特有字段
+            global_orient_w=global_orient_w,  # 世界坐标系 root orient
+            global_orient_c=global_orient_c,  # 相机坐标系 root orient
+            body_pose_aa=body_pose_aa,  # body pose axis-angle
+            transl_w_raw=transl_w.clone(),  # 保存原始 world transl（滑步修正前）
+            static_conf_logits=static_conf_logits,  # 静止置信度
+            skeleton_offset=skeleton_offset,  # SMPL root joint offset
+        )
+
+        # 存储相机内参到 camera_params（GVHMR 估计的）
+        K_fullimg = gvhmr_results['K_fullimg']  # (F, 3, 3)
+        if data.camera_params is None:
+            from lib.pipeline.core.data import CameraParams
+            data.camera_params = CameraParams(
+                intrinsics=K_fullimg[0].numpy() if isinstance(K_fullimg, torch.Tensor) else K_fullimg[0],
+                focal_length=float(K_fullimg[0, 0, 0]),
+            )
+
+        # 记录元数据
+        data.metadata['hpe_stats'] = {
+            'num_frames': num_frames,
+            'backend': 'gvhmr',
+            'use_mean_shape': self.use_mean_shape,
+        }
+
+        self.logger.info(f"GVHMR estimation completed for {num_frames} frames")
+        return data
+
     def _get_camera_params(self, data: PipelineData):
         """获取相机参数"""
         

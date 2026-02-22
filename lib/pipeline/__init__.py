@@ -44,6 +44,7 @@ from .components import (
     SLAMComponent,
     HPEComponent,
     EvaluationComponent,
+    SkatingRemovalComponent,
 )
 
 from .builder import PipelineBuilder
@@ -68,6 +69,7 @@ __all__ = [
     'SLAMComponent',
     'HPEComponent',
     'EvaluationComponent',
+    'SkatingRemovalComponent',
     
     # Builder
     'PipelineBuilder',
