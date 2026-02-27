@@ -52,7 +52,13 @@ class SegmentationComponent(BackendComponent):
             images = self._load_images(data.image_paths)
             data.images = images
 
-        bboxes = data.bboxes  # [N, K, 5]
+        bboxes = data.bboxes  # [N, K, 5] or [N, 4]
+
+        # 兼容 [N, 4] 格式的 GT bboxes（无 score，无 K 维度）
+        if bboxes.ndim == 2:
+            # [N, 4] -> [N, 1, 5]：增加 K 维度，补 score=1
+            scores = np.ones((len(bboxes), 1))
+            bboxes = np.hstack([bboxes, scores])[:, np.newaxis, :]
 
         num_frames = len(images)
         masks = []

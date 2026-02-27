@@ -56,12 +56,43 @@ class EvaluationComponent(Component):
             gender: SMPL(gender=gender) 
             for gender in ['neutral', 'male', 'female']
         }
+        
+        # GVHMR SMPL-X 模型和转换矩阵（延迟加载，首次 GVHMR 评估时初始化）
+        self._smplx_model = None
+        self._smplx2smpl = None
+        self._J_regressor = None
+        
         self._is_setup = True
         self.logger.info("Evaluation component initialized")
     
+    def _ensure_smplx_model(self, data: 'PipelineData'):
+        """延迟加载 GVHMR 的 SMPL-X 模型和转换矩阵"""
+        if self._smplx_model is not None:
+            return
+        
+        import sys, os
+        gvhmr_root = data.metadata.get('hpe_stats', {}).get('gvhmr_root', 'thirdparty/GVHMR')
+        gvhmr_abs = os.path.abspath(gvhmr_root)
+        if gvhmr_abs not in sys.path:
+            sys.path.insert(0, gvhmr_abs)
+        
+        from hmr4d.utils.smplx_utils import make_smplx
+        
+        self._smplx_model = make_smplx("supermotion")
+        self._smplx_model.eval()
+        self._smplx2smpl = torch.load(
+            os.path.join(gvhmr_abs, "hmr4d/utils/body_model/smplx2smpl_sparse.pt"),
+            weights_only=True
+        )
+        self._J_regressor = torch.load(
+            os.path.join(gvhmr_abs, "hmr4d/utils/body_model/smpl_neutral_J_regressor.pt"),
+            weights_only=True
+        )
+        self.logger.info("Loaded GVHMR SMPL-X model + smplx2smpl + J_regressor for evaluation")
+    
     def validate_input(self, data: PipelineData) -> bool:
         """验证输入：需要预测结果和 GT 标注"""
-        has_predictions = data.camera_params is not None and data.smpl_params is not None
+        has_predictions = data.smpl_params is not None
         has_gt = data.annotations is not None
         return has_predictions and has_gt
     
@@ -122,7 +153,7 @@ class EvaluationComponent(Component):
         
         # === 相机运动评估 ===
         if 'ate' in self.metrics_to_compute or 'ate_s' in self.metrics_to_compute:
-            cam_metrics = self._evaluate_camera_motion(data, gt_data)
+            cam_metrics = self._evaluate_camera_motion(data, gt_data, pred_data)
             metrics.update(cam_metrics)
         
         # 保存结果
@@ -171,6 +202,14 @@ class EvaluationComponent(Component):
 
         tt = lambda x: torch.from_numpy(x).float()
 
+        # 判断是否是 GVHMR 路径（Pred 用 SMPL-X + smplx2smpl + 外部 J_regressor）
+        smpl = data.smpl_params
+        is_gvhmr = (smpl is not None and smpl.rotmat is None and 
+                    getattr(smpl, 'global_orient_c', None) is not None)
+
+        # 判断是否是 PromptHMR 图像模型路径
+        is_phmr_imgonly = data.metadata.get('hpe_backend') == 'prompthmr_imgonly'
+
         # 世界坐标系下的 GT
         gt = self._smpls[gender](
             body_pose=tt(poses_body),
@@ -193,16 +232,39 @@ class EvaluationComponent(Component):
             default_smpl=True
         )
 
+        if is_phmr_imgonly:
+            # PromptHMR 图像模型路径：用 smpl.J_regressor[:24] 回归 joints（与官方 evaluator.py 一致）
+            phmr_j_reg = data.metadata.get('phmr_j_regressor')
+            if phmr_j_reg is not None:
+                gt_j3d = torch.matmul(phmr_j_reg, gt.vertices)
+                gt_j3d_cam = torch.matmul(phmr_j_reg, gt_cam.vertices)
+                self.logger.info("PromptHMR img-only path: Using smpl.J_regressor[:24] for GT joints")
+            else:
+                gt_j3d = gt.joints[:, :24]
+                gt_j3d_cam = gt_cam.joints[:, :24]
+                self.logger.info("PromptHMR img-only path: Using SMPL default joints[:24]")
+        elif is_gvhmr:
+            # GVHMR 路径：Pred 的 joints 是用外部 smpl_neutral_J_regressor.pt 从 vertices 回归的，
+            # GT 的 joints 也必须用相同的 J_regressor，否则会有系统性偏移。
+            # 这与 GVHMR 官方评估 (metric_emdb.py) 的做法一致。
+            self._ensure_smplx_model(data)
+            gt_j3d = torch.matmul(self._J_regressor, gt.vertices)
+            gt_j3d_cam = torch.matmul(self._J_regressor, gt_cam.vertices)
+            self.logger.info("GVHMR path: Using external J_regressor for GT joints (consistent with Pred)")
+        else:
+            gt_j3d = gt.joints[:, :24]
+            gt_j3d_cam = gt_cam.joints[:, :24]
+
         valid_mask = ann.get('good_frames_mask')
         if sampled_indices is not None and valid_mask is not None:
             valid_mask = valid_mask[sampled_indices]
 
         return {
             'gender': gender,
-            'gt_j3d': gt.joints[:, :24],
+            'gt_j3d': gt_j3d,
             'gt_vert': gt.vertices,
             'gt_ori': axis_angle_to_matrix(tt(poses_root)),
-            'gt_j3d_cam': gt_cam.joints[:, :24],
+            'gt_j3d_cam': gt_j3d_cam,
             'gt_vert_cam': gt_cam.vertices,
             'ext': ext,
             'valid_mask': valid_mask,
@@ -211,37 +273,173 @@ class EvaluationComponent(Component):
     def _compute_pred_smpl(self, data: PipelineData) -> Dict[str, Any]:
         """计算预测的 SMPL 输出"""
         from lib.vis.traj import traj_filter
+        from lib.utils.rotation_conversions import axis_angle_to_matrix
         
         smpl = data.smpl_params
         cam = data.camera_params
+
+        # PromptHMR 图像模型路径：vertices 和 joints 已预计算
+        is_phmr_imgonly = data.metadata.get('hpe_backend') == 'prompthmr_imgonly'
+        if is_phmr_imgonly:
+            pred_vert = smpl.vertices.float() if isinstance(smpl.vertices, torch.Tensor) else torch.from_numpy(smpl.vertices).float()
+            pred_j3d = smpl.joints.float() if isinstance(smpl.joints, torch.Tensor) else torch.from_numpy(smpl.joints).float()
+
+            # 图像模型只有 incam，世界坐标系用 identity 填充
+            F_len = pred_j3d.shape[0]
+            pred_vert_w = pred_vert.clone()
+            pred_j3d_w = pred_j3d.clone()
+            pred_ori_w = torch.eye(3).unsqueeze(0).expand(F_len, -1, -1)
+            pred_camr = torch.eye(3).unsqueeze(0).expand(F_len, -1, -1)
+            pred_camt = torch.zeros(F_len, 3)
+
+            return {
+                'pred_j3d': pred_j3d,
+                'pred_vert': pred_vert,
+                'pred_j3d_w': pred_j3d_w,
+                'pred_vert_w': pred_vert_w,
+                'pred_ori_w': pred_ori_w,
+                'pred_camr': pred_camr,
+                'pred_camt': pred_camt,
+            }
+
+        is_gvhmr = (smpl.rotmat is None and smpl.global_orient_c is not None)
         
-        pred_rotmat = torch.tensor(smpl.rotmat) if not isinstance(smpl.rotmat, torch.Tensor) else smpl.rotmat
-        pred_shape = torch.tensor(smpl.betas) if not isinstance(smpl.betas, torch.Tensor) else smpl.betas
-        pred_trans = torch.tensor(smpl.trans) if not isinstance(smpl.trans, torch.Tensor) else smpl.trans
+        def to_float_tensor(x):
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                return x.float()
+            return torch.from_numpy(np.array(x)).float()
         
-        # SMPL forward
-        pred = self._smpls['neutral'](
-            body_pose=pred_rotmat[:, 1:], 
-            global_orient=pred_rotmat[:, [0]], 
-            betas=pred_shape, 
-            transl=pred_trans.squeeze(),
-            pose2rot=False, 
-            default_smpl=True
-        )
+        pred_shape = to_float_tensor(smpl.betas)
+        pred_trans = to_float_tensor(smpl.trans)
         
-        pred_vert = pred.vertices
-        pred_j3d = pred.joints[:, :24]
-        
-        # 转换到世界坐标系
-        pred_camr = torch.tensor(cam.R) if not isinstance(cam.R, torch.Tensor) else cam.R
-        pred_camt = torch.tensor(cam.T) if not isinstance(cam.T, torch.Tensor) else cam.T
-        
-        pred_vert_w = torch.einsum('bij,bnj->bni', pred_camr, pred_vert) + pred_camt[:, None]
-        pred_j3d_w = torch.einsum('bij,bnj->bni', pred_camr, pred_j3d) + pred_camt[:, None]
-        pred_ori_w = torch.einsum('bij,bjk->bik', pred_camr, pred_rotmat[:, 0])
-        
-        # 轨迹滤波
-        pred_vert_w, pred_j3d_w = traj_filter(pred_vert_w, pred_j3d_w)
+        if is_gvhmr:
+            # GVHMR 使用 SMPL-X (supermotion) 模型，需要用 SMPL-X forward + smplx2smpl 转换
+            # 而不是直接用 SMPL forward，否则会因模型差异引入误差
+            self._ensure_smplx_model(data)
+            
+            global_orient_c = to_float_tensor(smpl.global_orient_c)  # (F, 3)
+            body_pose_aa = to_float_tensor(smpl.body_pose_aa)  # (F, 63)
+            
+            # root_rotmat 用于后续 c2w 变换
+            root_rotmat = axis_angle_to_matrix(global_orient_c)  # (F, 3, 3)
+            
+            # SMPL-X forward (camera coordinate system)
+            smplx_params_incam = {
+                'global_orient': global_orient_c,
+                'body_pose': body_pose_aa,
+                'betas': pred_shape,
+                'transl': pred_trans.squeeze(),
+            }
+            with torch.no_grad():
+                smplx_out = self._smplx_model(**smplx_params_incam)
+                # SMPL-X vertices (10475) -> SMPL vertices (6890) via smplx2smpl sparse matrix
+                pred_vert = torch.stack(
+                    [torch.matmul(self._smplx2smpl, v) for v in smplx_out.vertices]
+                )  # (F, 6890, 3)
+                # SMPL vertices -> 24 joints via J_regressor
+                pred_j3d = torch.matmul(self._J_regressor, pred_vert)  # (F, 24, 3)
+            
+            # World coordinates: prioritize SLAM c2w to transform incam SMPL to world
+            # (consistent with TRAM/VIMO path). GVHMR global params are only used for
+            # foot-skating cleanup and rendering, not as final global motion estimate.
+            cam = data.camera_params
+            use_slam_camera = (
+                cam is not None 
+                and getattr(cam, 'R', None) is not None 
+                and getattr(cam, 'T', None) is not None
+            )
+            
+            if use_slam_camera:
+                self.logger.info(
+                    "GVHMR path: Using SLAM c2w to transform incam SMPL to world (consistent with TRAM path)"
+                )
+                pred_camr = to_float_tensor(cam.R)
+                pred_camt = to_float_tensor(cam.T)
+                
+                pred_vert_w = torch.einsum('bij,bnj->bni', pred_camr, pred_vert) + pred_camt[:, None]
+                pred_j3d_w = torch.einsum('bij,bnj->bni', pred_camr, pred_j3d) + pred_camt[:, None]
+                pred_ori_w = torch.einsum('bij,bjk->bik', pred_camr, root_rotmat)
+            else:
+                self.logger.info(
+                    "GVHMR path: No SLAM camera available, falling back to GVHMR world params"
+                )
+                global_orient_w = to_float_tensor(smpl.global_orient_w)  # (F, 3)
+                transl_w = to_float_tensor(smpl.global_trans)  # (F, 3) post-correction
+                
+                # Build world-space SMPL-X from GVHMR global params, then convert
+                smplx_params_world = {
+                    'global_orient': global_orient_w,
+                    'body_pose': body_pose_aa,
+                    'betas': pred_shape,
+                    'transl': transl_w.squeeze(),
+                }
+                with torch.no_grad():
+                    smplx_out_w = self._smplx_model(**smplx_params_world)
+                    pred_vert_w = torch.stack(
+                        [torch.matmul(self._smplx2smpl, v) for v in smplx_out_w.vertices]
+                    )  # (F, 6890, 3)
+                    pred_j3d_w = torch.matmul(self._J_regressor, pred_vert_w)  # (F, 24, 3)
+                pred_ori_w = axis_angle_to_matrix(global_orient_w)  # (F, 3, 3)
+                
+                # Derive c2w from GVHMR's w2c for camera metrics (ATE etc.)
+                import sys, os
+                gvhmr_root = data.metadata.get('hpe_stats', {}).get('gvhmr_root', 'thirdparty/GVHMR')
+                gvhmr_abs = os.path.abspath(gvhmr_root)
+                if gvhmr_abs not in sys.path:
+                    sys.path.insert(0, gvhmr_abs)
+                try:
+                    from hmr4d.utils.geo.hmr_global import get_T_w2c_from_wcparams
+                    skeleton_offset = to_float_tensor(smpl.skeleton_offset)
+                    transl_w_raw = to_float_tensor(smpl.transl_w_raw)
+                    transl_c = to_float_tensor(smpl.trans)
+                    
+                    T_w2c = get_T_w2c_from_wcparams(
+                        global_orient_w, transl_w_raw,
+                        global_orient_c, transl_c,
+                        skeleton_offset,
+                    )  # (F, 4, 4)
+                    R_w2c = T_w2c[:, :3, :3]
+                    t_w2c = T_w2c[:, :3, 3]
+                    pred_camr = R_w2c.transpose(1, 2)  # R_c2w
+                    pred_camt = -torch.einsum('bij,bj->bi', pred_camr, t_w2c)  # t_c2w
+                except Exception as e:
+                    self.logger.warning(f"Failed to compute c2w from GVHMR params: {e}, using identity")
+                    F_len = pred_j3d.shape[0]
+                    pred_camr = torch.eye(3).unsqueeze(0).expand(F_len, -1, -1)
+                    pred_camt = torch.zeros(F_len, 3)
+            
+            # Trajectory filter
+            pred_vert_w, pred_j3d_w = traj_filter(pred_vert_w, pred_j3d_w)
+            
+        else:
+            # VIMO / GT path: original logic
+            pred_rotmat = to_float_tensor(smpl.rotmat)
+            
+            # SMPL forward
+            pred = self._smpls['neutral'](
+                body_pose=pred_rotmat[:, 1:], 
+                global_orient=pred_rotmat[:, [0]], 
+                betas=pred_shape, 
+                transl=pred_trans.squeeze(),
+                pose2rot=False, 
+                default_smpl=True
+            )
+            
+            pred_vert = pred.vertices
+            pred_j3d = pred.joints[:, :24]
+            
+            # 转换到世界坐标系
+            pred_camr = to_float_tensor(cam.R)
+            pred_camt = to_float_tensor(cam.T)
+            
+            pred_vert_w = torch.einsum('bij,bnj->bni', pred_camr, pred_vert) + pred_camt[:, None]
+            pred_j3d_w = torch.einsum('bij,bnj->bni', pred_camr, pred_j3d) + pred_camt[:, None]
+            pred_ori_w = torch.einsum('bij,bjk->bik', pred_camr, pred_rotmat[:, 0])
+            
+            # 轨迹滤波
+            pred_vert_w, pred_j3d_w = traj_filter(pred_vert_w, pred_j3d_w)
         
         return {
             'pred_j3d': pred_j3d,
@@ -350,7 +548,7 @@ class EvaluationComponent(Component):
         from lib.utils.eval_utils import computer_erve
         return computer_erve(gt_ori, gt_j3d, pred_ori, pred_j3d)
     
-    def _evaluate_camera_motion(self, data: PipelineData, gt_data):
+    def _evaluate_camera_motion(self, data: PipelineData, gt_data, pred_data=None):
         """评估相机运动"""
         from lib.utils.rotation_conversions import matrix_to_quaternion
         from lib.camera.slam_utils import eval_slam
@@ -360,8 +558,20 @@ class EvaluationComponent(Component):
         cam_t = np.einsum('bij, bj->bi', cam_r, -ext[:, :3, -1])
         cam_q = matrix_to_quaternion(torch.from_numpy(cam_r)).numpy()
         
-        pred_camr = data.camera_params.R
-        pred_camt = data.camera_params.T
+        # Use camera_params.R/T if available, otherwise fall back to pred_data
+        pred_camr = None
+        pred_camt = None
+        if data.camera_params is not None:
+            pred_camr = data.camera_params.R
+            pred_camt = data.camera_params.T
+        
+        if pred_camr is None and pred_data is not None:
+            pred_camr = pred_data.get('pred_camr')
+            pred_camt = pred_data.get('pred_camt')
+        
+        if pred_camr is None or pred_camt is None:
+            self.logger.warning("No camera R/T available for ATE evaluation, skipping")
+            return {'ate': 0.0, 'ate_s': 0.0}
         
         if isinstance(pred_camr, torch.Tensor):
             pred_camr = pred_camr

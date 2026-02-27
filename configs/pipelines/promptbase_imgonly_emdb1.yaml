@@ -1,0 +1,59 @@
+# PromptHMR Image-Only Pipeline (EMDB1 - InCam Evaluation)
+# 仅使用 PromptHMR 图像模型逐帧推理，不经过视频头
+# 与 PromptHMR 官方评估 (eval_phmr.py + evaluator.py) 完全对齐
+# EMDB1 仅评估 incam 指标（pa_mpjpe, mpjpe, pve, accel）
+#
+# Pipeline 流程：
+#   1. Segmentation (SAM) - 人体分割
+#   2. HPE (PromptHMR Image-Only) - 逐帧推理（无视频头）
+#   3. Evaluation - 评估指标（仅 incam）
+
+name: "PromptHMR Image-Only Pipeline (EMDB1)"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/promptbase_imgonly_emdb1"
+
+components:
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. PromptHMR Image-Only (HPE)
+  - type: hpe
+    name: prompthmr_imgonly_inference
+    backend: prompthmr_imgonly
+    prompthmr_root: "../PromptHMR"
+    phmr_ckpt: "data/pretrain/phmr/checkpoint.ckpt"
+    mask_prompt: true
+    img_size: 896
+    use_mean_shape: true
+    substep_cache_use: true
+    substep_cache_overwrite: false
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 3. Evaluation (EMDB1: incam metrics only)
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_prompthmr_imgonly_inference'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: false
+    params:
+      output_subdir: 'incam_imgonly'
+      frame_range: [0, 5]

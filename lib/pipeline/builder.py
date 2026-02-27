@@ -15,6 +15,8 @@ from .components import (
     EvaluationComponent,
     AdjacentSMPLRenderer,
     SkatingRemovalComponent,
+    WorldTransformComponent,
+    DepthSceneRefineComponent,
 )
 
 
@@ -51,6 +53,8 @@ class PipelineBuilder:
         'evaluation': EvaluationComponent,
         'adjacent_smpl_renderer': AdjacentSMPLRenderer,
         'skating_removal': SkatingRemovalComponent,
+        'world_transform': WorldTransformComponent,
+        'depth_scene_refine': DepthSceneRefineComponent,
     }
     
     @classmethod

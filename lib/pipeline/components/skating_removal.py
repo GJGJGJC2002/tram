@@ -76,8 +76,28 @@ class SkatingRemovalComponent(Component):
         if gvhmr_abs not in sys.path:
             sys.path.insert(0, gvhmr_abs)
 
-        from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
-        self.endecoder = EnDecoder().to(self.device)
+        # 确保 hmr4d 从 gvhmr_root 加载（skating_removal 依赖 GVHMR 原版的 EnDecoder）
+        # 清除可能由 PromptHMR 版本占据的 hmr4d 模块缓存
+        hmr4d_modules = [k for k in sys.modules if k.startswith('hmr4d')]
+        for mod_name in hmr4d_modules:
+            del sys.modules[mod_name]
+
+        # 确保 gvhmr_root 在 sys.path 最前面，优先于 PromptHMR 版本
+        if sys.path[0] != gvhmr_abs:
+            if gvhmr_abs in sys.path:
+                sys.path.remove(gvhmr_abs)
+            sys.path.insert(0, gvhmr_abs)
+
+        old_cwd = os.getcwd()
+        os.chdir(gvhmr_abs)
+
+        try:
+            from hmr4d.model.gvhmr.utils.endecoder import EnDecoder
+            # GVHMR 原版的 EnDecoder 不接受 smplx_path 参数，
+            # 它通过 PROJ_ROOT 自动定位 body model 文件
+            self.endecoder = EnDecoder().to(self.device)
+        finally:
+            os.chdir(old_cwd)
 
         self._is_setup = True
         self.logger.info("SkatingRemoval component initialized")
@@ -99,11 +119,17 @@ class SkatingRemovalComponent(Component):
 
         # 重建 GVHMR outputs 格式（pp_static_joint 和 process_ik 需要的格式）
         # 注意：这些函数期望 batch 维度 (B, L, ...)
-        global_orient_w = sp.global_orient_w  # (F, 3)
-        body_pose_aa = sp.body_pose_aa  # (F, 63)
-        betas = sp.betas  # (F, 10)
-        transl_w_raw = sp.transl_w_raw  # (F, 3) 原始 world transl
-        static_conf_logits = sp.static_conf_logits  # (F, J)
+        # 缓存加载后字段可能是 numpy 数组，需要转为 tensor
+        def _to_tensor(x):
+            if x is None:
+                return None
+            return torch.from_numpy(x).float() if isinstance(x, __import__('numpy').ndarray) else x
+
+        global_orient_w = _to_tensor(sp.global_orient_w)  # (F, 3)
+        body_pose_aa = _to_tensor(sp.body_pose_aa)  # (F, 63)
+        betas = _to_tensor(sp.betas)  # (F, 10)
+        transl_w_raw = _to_tensor(sp.transl_w_raw)  # (F, 3) 原始 world transl
+        static_conf_logits = _to_tensor(sp.static_conf_logits)  # (F, J)
 
         # 添加 batch 维度 -> (1, F, ...)
         outputs = {

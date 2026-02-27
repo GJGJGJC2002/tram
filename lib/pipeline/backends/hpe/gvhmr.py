@@ -111,6 +111,7 @@ class GVHMRBackend(Backend):
         bboxes: np.ndarray,
         img_focal: float = None,
         img_center: np.ndarray = None,
+        K_fullimg_override: np.ndarray = None,
     ) -> Dict[str, Any]:
         """
         运行 GVHMR 推理
@@ -120,6 +121,9 @@ class GVHMRBackend(Backend):
             bboxes: 边界框 [N, 4] 或 [N, K, 5]
             img_focal: 图像焦距（可选，None 则由 GVHMR 自行估计）
             img_center: 图像主点（可选）
+            K_fullimg_override: 完整的 3x3 相机内参矩阵（可选）。
+                如果提供，将直接作为 K_fullimg 使用，忽略 img_focal。
+                这是 GVHMR 官方评估 EMDB 时的做法。
 
         Returns:
             包含 GVHMR 全部输出的字典
@@ -138,7 +142,8 @@ class GVHMRBackend(Backend):
 
         try:
             import cv2
-            from hmr4d.utils.preproc import Tracker, Extractor, VitPoseExtractor, SimpleVO
+            from hmr4d.utils.preproc import Tracker, Extractor, VitPoseExtractor
+            from hmr4d.utils.preproc.vitfeat_extractor import get_batch
             from hmr4d.utils.geo.hmr_cam import (
                 get_bbx_xys_from_xyxy,
                 estimate_K,
@@ -154,6 +159,19 @@ class GVHMRBackend(Backend):
             height, width = first_img.shape[:2]
             self.logger.info(f"GVHMR processing {N} frames, image size: {width}x{height}")
 
+            # 读取所有图片到 numpy 数组 (N, H, W, 3) RGB
+            self.logger.info(f"Loading {N} images...")
+            from tqdm import tqdm
+            imgs_list = []
+            for p in tqdm(image_paths, desc="Loading images", leave=False):
+                img = cv2.imread(p)
+                if img is None:
+                    raise FileNotFoundError(f"Failed to load image: {p}")
+                imgs_list.append(img[..., ::-1])  # BGR → RGB
+            imgs_np = np.stack(imgs_list)
+            del imgs_list
+            self.logger.info(f"Loaded {N} images")
+
             # --- 1. 准备 bboxes ---
             if bboxes.ndim == 3:
                 bboxes_xyxy = bboxes[:, 0, :4]
@@ -167,42 +185,119 @@ class GVHMRBackend(Backend):
 
             # --- 2. VitPose 关键点检测 ---
             self.logger.info("Running VitPose...")
-            vitpose_extractor = VitPoseExtractor()
-            vitpose = vitpose_extractor.extract_from_images(image_paths, bbx_xys)
-            del vitpose_extractor
+            self.logger.info("Initializing VitPoseExtractor (loading model)...")
+            vitpose_extractor = VitPoseExtractor(tqdm_leave=False)
+            self.logger.info("Preprocessing images for VitPose...")
+            # VitPoseExtractor.extract 接受 Tensor 或 video_path
+            # 通过 get_batch(np_array, ..., path_type="np") 预处理图片为 Tensor
+            vitpose_imgs, vitpose_bbx_xys = get_batch(imgs_np, bbx_xys, img_ds=1.0, path_type="np")
+            self.logger.info("Running VitPose inference...")
+            vitpose = vitpose_extractor.extract(vitpose_imgs, vitpose_bbx_xys)
+            del vitpose_extractor, vitpose_imgs, vitpose_bbx_xys
             torch.cuda.empty_cache()
+            self.logger.info("VitPose complete")
 
             # --- 3. ViT 特征提取 ---
             self.logger.info("Running ViT feature extraction...")
-            extractor = Extractor()
-            vit_features = extractor.extract_image_features(image_paths, bbx_xys)
-            del extractor
+            self.logger.info("Initializing HMR2 feature extractor (loading model)...")
+            extractor = Extractor(tqdm_leave=False)
+            # get_batch path_type="np" 要求 img_ds=1.0，先手动缩放图片模拟 img_ds=0.5
+            self.logger.info("Downsampling images for ViT...")
+            vit_img_ds = 0.5
+            imgs_ds = np.stack([
+                cv2.resize(img, (0, 0), fx=vit_img_ds, fy=vit_img_ds)
+                for img in imgs_np
+            ])
+            bbx_xys_ds = bbx_xys.clone()
+            bbx_xys_ds[:, :2] *= vit_img_ds  # center
+            bbx_xys_ds[:, 2] *= vit_img_ds   # size
+            self.logger.info("Preprocessing images for ViT...")
+            vit_imgs, _ = get_batch(imgs_ds, bbx_xys_ds, img_ds=1.0, path_type="np")
+            self.logger.info("Running ViT feature extraction inference...")
+            vit_features = extractor.extract_video_features(vit_imgs, bbx_xys)
+            del extractor, vit_imgs, imgs_ds, imgs_np
             torch.cuda.empty_cache()
+            self.logger.info("ViT feature extraction complete")
 
             # --- 4. 视觉里程计（相机旋转估计） ---
             if self.static_cam:
+                self.logger.info("Using static camera assumption (skipping VO)")
                 R_w2c = torch.eye(3).repeat(N, 1, 1)
             else:
                 self.logger.info(f"Running Visual Odometry ({self.vo_method})...")
-                simple_vo = SimpleVO(
-                    image_paths,
-                    scale=self.vo_scale,
-                    step=self.vo_step,
-                    method=self.vo_method,
-                    f_mm=self.f_mm,
-                    width=width,
-                    height=height,
+                # SimpleVO 接受 video_path，但我们有 image_paths
+                # 手动读取图片并缩放，然后直接调用 SimpleVO 内部逻辑
+                from hmr4d.utils.preproc.relpose.utils import focal_length_from_mm
+                from hmr4d.utils.preproc.relpose.matcher_wrapper import Matcher
+                from hmr4d.utils.preproc.relpose.solver_two_view import (
+                    TwoPairSolver, CameraParams, interpolate_missing_frames,
                 )
-                vo_results = simple_vo.compute()
+
+                vo_scale = self.vo_scale
+                vo_step = self.vo_step
+                f_mm = 24 if self.f_mm is None else self.f_mm
+
+                # 读取并缩放图片
+                frames = np.stack([
+                    cv2.resize(
+                        cv2.imread(p),
+                        (0, 0), fx=vo_scale, fy=vo_scale
+                    ) for p in image_paths
+                ])  # (N, H', W', 3) BGR
+
+                # 采样帧
+                sample_idxs = np.arange(0, N, vo_step)
+                if sample_idxs[-1] != N - 1:
+                    sample_idxs = np.concatenate([sample_idxs, [N - 1]])
+                sampled_frames = frames[sample_idxs]
+                _, H_vo, W_vo, _ = sampled_frames.shape
+                self.logger.info(f"VO: {len(sampled_frames)} sampled frames, size {W_vo}x{H_vo}")
+
+                matcher = Matcher(self.vo_method)
+                camera_params = CameraParams(W_vo, H_vo, focal_length=focal_length_from_mm(W_vo, H_vo, f_mm))
+                solver = TwoPairSolver(camera_params, solver="cv2")
+
+                # 计算帧间变换
+                T_w2c_list = [np.eye(4)]
+                prev_frame = sampled_frames[0]
+                for fi in tqdm(range(1, len(sampled_frames)), desc="SimpleVO"):
+                    curr_frame = sampled_frames[fi]
+                    pts0, pts1 = matcher.match_np(prev_frame, curr_frame)
+                    T_delta = solver.solve(pts0, pts1)
+                    T_w2c_list.append(T_delta @ T_w2c_list[-1])
+                    prev_frame = curr_frame
+
+                # 插值缺失帧
+                vo_results = interpolate_missing_frames(T_w2c_list, sample_idxs)
                 R_w2c = torch.from_numpy(vo_results[:, :3, :3])
+                del frames, sampled_frames
+                self.logger.info("Visual Odometry complete")
 
             # --- 5. 构建相机内参 ---
-            if self.f_mm is not None:
+            self.logger.info("Estimating camera intrinsics...")
+            if K_fullimg_override is not None:
+                # 直接使用外部传入的完整 K 矩阵（如 GT 内参），与 GVHMR 官方评估 EMDB 一致
+                K_np = K_fullimg_override
+                if isinstance(K_np, np.ndarray):
+                    K_np = torch.from_numpy(K_np).float()
+                K_fullimg = K_np.unsqueeze(0).repeat(N, 1, 1) if K_np.ndim == 2 else K_np[:1].repeat(N, 1, 1)
+                self.logger.info(
+                    f"Using provided K matrix: fx={float(K_fullimg[0,0,0]):.2f}, "
+                    f"fy={float(K_fullimg[0,1,1]):.2f}, "
+                    f"cx={float(K_fullimg[0,0,2]):.2f}, cy={float(K_fullimg[0,1,2]):.2f}"
+                )
+            elif img_focal is not None:
+                # 使用外部传入的焦距（如 GT 焦距），确保 transl_c 深度与相机 scale 匹配
+                from hmr4d.utils.geo.hmr_cam import convert_f_to_K
+                K_fullimg = convert_f_to_K(img_focal, width, height).repeat(N, 1, 1)
+                self.logger.info(f"Using provided focal length: {img_focal:.2f}")
+            elif self.f_mm is not None:
                 K_fullimg = create_camera_sensor(width, height, self.f_mm)[2].repeat(N, 1, 1)
             else:
                 K_fullimg = estimate_K(width, height).repeat(N, 1, 1)
 
             # --- 6. 组装数据 ---
+            self.logger.info("Assembling input data for GVHMR...")
             data = {
                 "length": torch.tensor(N),
                 "bbx_xys": bbx_xys,
@@ -213,9 +308,10 @@ class GVHMRBackend(Backend):
             }
 
             # --- 7. GVHMR 推理 ---
-            self.logger.info("Running GVHMR inference...")
+            self.logger.info("Running GVHMR model inference (this may take a while)...")
             pred = self.model.predict(data, static_cam=self.static_cam)
             pred = detach_to_cpu(pred)
+            self.logger.info("GVHMR model inference complete")
 
             # --- 8. 计算 skeleton offset ---
             betas_global = pred["smpl_params_global"]["betas"]  # (F, 10)

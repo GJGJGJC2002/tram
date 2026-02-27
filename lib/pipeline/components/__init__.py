@@ -7,6 +7,8 @@ from .hpe import HPEComponent
 from .evaluation import EvaluationComponent
 from .adjacent_smpl_renderer import AdjacentSMPLRenderer
 from .skating_removal import SkatingRemovalComponent
+from .world_transform import WorldTransformComponent
+from .depth_scene_refine import DepthSceneRefineComponent
 
 __all__ = [
     'DetectionComponent',
@@ -16,6 +18,8 @@ __all__ = [
     'EvaluationComponent',
     'AdjacentSMPLRenderer',
     'SkatingRemovalComponent',
+    'WorldTransformComponent',
+    'DepthSceneRefineComponent',
 ]
 
 

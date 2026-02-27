@@ -692,6 +692,511 @@ def early_stopping_on_convergence(data: PipelineData):
         data.metadata['_prev_convergence_value'] = current_value
 
 
+def visualize_incam_global(data: PipelineData):
+    """
+    类似 GVHMR demo 的 incam_global 可视化：
+    左侧为 incam（SMPL mesh 叠加在原始视频帧上），
+    右侧为 global（鸟瞰视角的人体全局轨迹）。
+    
+    全局轨迹使用 SLAM 估计的 c2w 将 GVHMR 的 incam 顶点转换到世界坐标系。
+    
+    在 SLAM 之后、Evaluation 之前调用。
+    输出为逐帧图片保存到 visualization/incam_global/ 目录。
+    """
+    import sys
+    import cv2
+    
+    # --- 检查必要数据 ---
+    if data.smpl_params is None:
+        logger.warning("[incam_global] No SMPL params available")
+        return
+    if data.camera_params is None or data.camera_params.R is None or data.camera_params.T is None:
+        logger.warning("[incam_global] No camera c2w params available (need SLAM results)")
+        return
+    if len(data.image_paths) == 0:
+        logger.warning("[incam_global] No image paths available")
+        return
+    
+    output_dir = data.metadata.get('output_dir', 'results')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', 'incam_global')
+    os.makedirs(vis_dir, exist_ok=True)
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # --- 获取图像尺寸 ---
+    img_sample = cv2.imread(data.image_paths[0])
+    if img_sample is None:
+        logger.warning("[incam_global] Cannot read first image")
+        return
+    H, W = img_sample.shape[:2]
+    N = len(data.image_paths)
+    
+    # --- 加载 SMPL 模型 ---
+    try:
+        from lib.models.smpl import SMPL
+        from lib.vis.renderer import Renderer as PipelineRenderer
+    except ImportError:
+        logger.warning("[incam_global] SMPL or Renderer not available")
+        return
+    
+    smpl_model = SMPL().to(device)
+    faces_smpl = smpl_model.faces
+    
+    # --- 获取相机内参 ---
+    intrinsics = None
+    if data.camera_params and data.camera_params.intrinsics is not None:
+        intrinsics = data.camera_params.intrinsics
+    elif data.annotations and 'camera' in data.annotations and 'intrinsics' in data.annotations['camera']:
+        intrinsics = data.annotations['camera']['intrinsics']
+    
+    if intrinsics is None:
+        logger.warning("[incam_global] No camera intrinsics found")
+        return
+    
+    if isinstance(intrinsics, torch.Tensor):
+        intrinsics = intrinsics.cpu().numpy()
+    focal_length = float((intrinsics[0, 0] + intrinsics[1, 1]) / 2.0)
+    
+    # --- 获取 c2w 参数 ---
+    R_c2w = data.camera_params.R  # [N, 3, 3]
+    T_c2w = data.camera_params.T  # [N, 3]
+    if isinstance(R_c2w, np.ndarray):
+        R_c2w = torch.from_numpy(R_c2w).float()
+    if isinstance(T_c2w, np.ndarray):
+        T_c2w = torch.from_numpy(T_c2w).float()
+    
+    # --- 获取 SMPL 参数 ---
+    sp = data.smpl_params
+    
+    # 检查是否为 GVHMR 输出（axis-angle 格式）还是标准格式（rotmat）
+    is_gvhmr = (sp.global_orient_c is not None and sp.body_pose_aa is not None)
+    
+    if is_gvhmr:
+        # GVHMR 模式：使用 axis-angle 字段
+        if sp.trans is None:
+            logger.warning("[incam_global] SMPL trans (incam) is None")
+            return
+        
+        global_orient_c = sp.global_orient_c  # [N, 3] axis-angle
+        body_pose_aa = sp.body_pose_aa        # [N, 63] axis-angle
+        betas = sp.betas                      # [N, 10]
+        trans = sp.trans                      # [N, 3] incam translation
+        
+        def _to_tensor(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float().to(device)
+            return x.float().to(device)
+        
+        global_orient_c = _to_tensor(global_orient_c)
+        body_pose_aa = _to_tensor(body_pose_aa)
+        betas = _to_tensor(betas)
+        trans = _to_tensor(trans)
+        
+        # GVHMR body_pose 是 21 joints (63 dim)，SMPL 需要 23 joints (69 dim)
+        F_len = body_pose_aa.shape[0]
+        if body_pose_aa.shape[-1] == 63:
+            padding = torch.zeros(F_len, 6, device=device)
+            body_pose_aa = torch.cat([body_pose_aa, padding], dim=-1)  # [N, 69]
+        
+        # --- 1. 生成 incam vertices ---
+        logger.info("[incam_global] Generating incam vertices (GVHMR axis-angle mode)...")
+        with torch.no_grad():
+            smpl_out = smpl_model(
+                global_orient=global_orient_c,  # [N, 3] axis-angle
+                body_pose=body_pose_aa,          # [N, 69] axis-angle
+                betas=betas,
+                transl=trans,
+                pose2rot=True,
+                default_smpl=True,
+            )
+            verts_incam = smpl_out.vertices  # [N, 6890, 3]
+    else:
+        # 标准模式：使用 rotmat 字段
+        if sp.rotmat is None or sp.trans is None:
+            logger.warning("[incam_global] SMPL rotmat or trans is None")
+            return
+        
+        rotmat = sp.rotmat  # [N, 24, 3, 3]
+        betas = sp.betas    # [N, 10]
+        trans = sp.trans     # [N, 3] incam translation
+        
+        if isinstance(rotmat, np.ndarray):
+            rotmat = torch.from_numpy(rotmat).float()
+        if isinstance(betas, np.ndarray):
+            betas = torch.from_numpy(betas).float()
+        if isinstance(trans, np.ndarray):
+            trans = torch.from_numpy(trans).float()
+        
+        rotmat = rotmat.to(device)
+        betas = betas.to(device)
+        trans = trans.to(device)
+        
+        # --- 1. 生成 incam vertices ---
+        logger.info("[incam_global] Generating incam vertices (rotmat mode)...")
+        with torch.no_grad():
+            global_orient = rotmat[:, [0]]   # [N, 1, 3, 3]
+            body_pose = rotmat[:, 1:]        # [N, 23, 3, 3]
+            smpl_out = smpl_model(
+                global_orient=global_orient,
+                body_pose=body_pose,
+                betas=betas,
+                transl=trans,
+                pose2rot=False,
+                default_smpl=True,
+            )
+            verts_incam = smpl_out.vertices  # [N, 6890, 3]
+    
+    # --- 2. 将 incam vertices 通过 c2w 转换到世界坐标系 ---
+    logger.info("[incam_global] Transforming vertices to world coords via c2w...")
+    verts_world = torch.zeros_like(verts_incam)
+    for i in range(N):
+        R_i = R_c2w[i].to(device)   # [3, 3]
+        T_i = T_c2w[i].to(device)   # [3]
+        # p_world = R_c2w @ p_cam + T_c2w
+        verts_world[i] = torch.einsum('ij,vj->vi', R_i, verts_incam[i]) + T_i
+    
+    # --- 3. 对全局顶点做 move_to_start_point_face_z 处理 ---
+    # 从 SMPL joints 获取 J_regressor
+    J_regressor = smpl_model.J_regressor.to(device)  # [J, V]
+    
+    def move_to_start_point_face_z(verts, J_reg):
+        """XZ to origin, Start from the ground, Face-Z"""
+        from pytorch3d.transforms import axis_angle_to_matrix as aa2mat
+        verts = verts.clone()
+        joints = torch.einsum('jv,fvi->fji', J_reg, verts)  # [F, J, 3]
+        
+        # offset: root joint of first frame
+        offset = joints[0, 0].clone()  # [3]
+        offset[1] = verts[:, :, 1].min()  # ground level
+        verts = verts - offset
+        
+        # face direction: 从 hip 和 shoulder 的左右差推断面朝方向
+        joints = torch.einsum('jv,fvi->fji', J_reg, verts)
+        # 简化处理：不做面朝 Z 的旋转（GVHMR demo 里用了 compute_T_ayfz2ay，
+        # 这里简化为只做位移归零）
+        return verts
+    
+    verts_glob = move_to_start_point_face_z(verts_world, J_regressor)
+    joints_glob = torch.einsum('jv,fvi->fji', J_regressor, verts_glob)  # [F, J, 3]
+    
+    # --- 4. 设置全局相机 ---
+    # 使用 GVHMR 的 get_global_cameras_static
+    gvhmr_root = data.metadata.get('gvhmr_root', 'thirdparty/GVHMR')
+    gvhmr_abs = os.path.abspath(gvhmr_root)
+    if gvhmr_abs not in sys.path:
+        sys.path.insert(0, gvhmr_abs)
+    
+    from hmr4d.utils.vis.renderer import (
+        Renderer as GVHMRRenderer,
+        get_global_cameras_static,
+        get_ground_params_from_points,
+    )
+    from hmr4d.utils.geo.hmr_cam import create_camera_sensor
+    
+    global_R, global_T, global_lights = get_global_cameras_static(
+        verts_glob.cpu(),
+        beta=2.0,
+        cam_height_degree=20,
+        target_center_height=1.0,
+    )
+    
+    # 用 24mm 虚拟镜头渲染全局视图
+    _, _, K_global = create_camera_sensor(W, H, 24)
+    global_renderer = GVHMRRenderer(W, H, device=device, faces=faces_smpl, K=K_global)
+    
+    # 设置地面
+    scale, cx, cz = get_ground_params_from_points(joints_glob[:, 0].cpu(), verts_glob.cpu())
+    global_renderer.set_ground(scale * 1.5, cx, cz)
+    
+    # incam renderer
+    incam_renderer = PipelineRenderer(W, H, focal_length, device, faces=faces_smpl,
+                                      bin_size=-1, max_faces_per_bin=30000)
+    
+    # --- 5. 逐帧渲染并拼接 ---
+    logger.info(f"[incam_global] Rendering {N} frames...")
+    from tqdm import tqdm
+    
+    color_global = torch.ones(3).float().to(device) * 0.8
+    
+    for i in tqdm(range(N), desc="Rendering incam_global"):
+        try:
+            # --- incam ---
+            img = cv2.imread(data.image_paths[i])
+            if img is None:
+                continue
+            img_incam = incam_renderer.render_mesh(
+                verts_incam[i].to(device), img.copy(), colors=[0.8, 0.8, 0.8]
+            )
+            
+            # --- global ---
+            cameras = global_renderer.create_camera(global_R[i], global_T[i])
+            img_global = global_renderer.render_with_ground(
+                verts_glob[[i]].to(device), color_global[None], cameras, global_lights
+            )
+            
+            # --- 水平拼接 ---
+            # 确保尺寸一致
+            if img_incam.shape[:2] != img_global.shape[:2]:
+                img_global = cv2.resize(img_global, (img_incam.shape[1], img_incam.shape[0]))
+            merged = np.concatenate([img_incam, img_global], axis=1)
+            
+            # 保存
+            frame_name = os.path.basename(data.image_paths[i])
+            output_path = os.path.join(vis_dir, frame_name)
+            cv2.imwrite(output_path, merged)
+            
+        except Exception as e:
+            logger.warning(f"[incam_global] Failed to render frame {i}: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+            continue
+    
+    # 清理 GPU 内存
+    del verts_incam, verts_world, verts_glob, smpl_model, incam_renderer, global_renderer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    logger.info(f"[incam_global] Visualization saved to {vis_dir} ({N} frames)")
+
+
+def visualize_incam_global_gvhmr(data: PipelineData, output_subdir: str = 'incam_global', frame_range: list = None):
+    """
+    GVHMR demo 风格的 incam_global 可视化（不依赖 SLAM）。
+    
+    直接使用 GVHMR 输出的 smpl_params_incam / smpl_params_global 分别生成
+    incam 和 global vertices，然后渲染拼接。
+    
+    - incam: 使用 global_orient_c + body_pose_aa + betas + trans(incam) + K_fullimg
+    - global: 使用 global_orient_w + body_pose_aa + betas + global_trans + move_to_start_point_face_z
+    
+    在 HPE (GVHMR) 之后即可调用，无需等待 SLAM 完成。
+    
+    Args:
+        data: PipelineData
+        output_subdir: 可视化输出子目录名称，默认 'incam_global'
+        frame_range: 渲染帧范围 [start, end]，例如 [0, 50] 表示渲染第 0~49 帧。None 表示渲染全部帧。
+    """
+    import sys
+    import cv2
+
+    # --- 检查必要数据 ---
+    if data.smpl_params is None:
+        logger.warning("[incam_global_gvhmr] No SMPL params available")
+        return
+    sp = data.smpl_params
+    if sp.global_orient_c is None or sp.global_orient_w is None or sp.body_pose_aa is None:
+        logger.warning("[incam_global_gvhmr] Not a GVHMR output (missing global_orient_c/w or body_pose_aa)")
+        return
+    if len(data.image_paths) == 0:
+        logger.warning("[incam_global_gvhmr] No image paths available")
+        return
+
+    output_dir = data.metadata.get('output_dir', 'results')
+    seq_name = data.metadata.get('sequence_name', data.sequence_name or 'unnamed')
+    vis_dir = os.path.join(output_dir, seq_name, 'visualization', output_subdir)
+    os.makedirs(vis_dir, exist_ok=True)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    # --- 获取图像尺寸 ---
+    img_sample = cv2.imread(data.image_paths[0])
+    if img_sample is None:
+        logger.warning("[incam_global_gvhmr] Cannot read first image")
+        return
+    H, W = img_sample.shape[:2]
+    N = len(data.image_paths)
+
+    # --- 加载 GVHMR 的渲染器和工具 ---
+    gvhmr_root = data.metadata.get('gvhmr_root', 'thirdparty/GVHMR')
+    gvhmr_abs = os.path.abspath(gvhmr_root)
+    if gvhmr_abs not in sys.path:
+        sys.path.insert(0, gvhmr_abs)
+
+    try:
+        from hmr4d.utils.smplx_utils import make_smplx
+        from hmr4d.utils.vis.renderer import (
+            Renderer as GVHMRRenderer,
+            get_global_cameras_static,
+            get_ground_params_from_points,
+        )
+        from hmr4d.utils.geo.hmr_cam import create_camera_sensor
+        from hmr4d.utils.geo_transform import compute_T_ayfz2ay, apply_T_on_points
+    except ImportError as e:
+        logger.warning(f"[incam_global_gvhmr] Failed to import GVHMR modules: {e}")
+        return
+
+    # --- 构建 SMPL-X 模型和转换矩阵 ---
+    logger.info("[incam_global_gvhmr] Loading SMPL-X model...")
+    smplx_model = make_smplx("supermotion").to(device)
+    smplx2smpl = torch.load(
+        os.path.join(gvhmr_abs, "hmr4d/utils/body_model/smplx2smpl_sparse.pt")
+    ).to(device)
+    faces_smpl = make_smplx("smpl").faces
+    J_regressor = torch.load(
+        os.path.join(gvhmr_abs, "hmr4d/utils/body_model/smpl_neutral_J_regressor.pt")
+    ).to(device)
+
+    # --- 辅助函数 ---
+    def _to_tensor(x):
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x).float().to(device)
+        return x.float().to(device)
+
+    def _to_cuda_dict(d):
+        return {k: v.to(device) if isinstance(v, torch.Tensor) else torch.from_numpy(v).float().to(device)
+                for k, v in d.items()}
+
+    # --- 获取 SMPL 参数 ---
+    global_orient_c = _to_tensor(sp.global_orient_c)  # (F, 3)
+    global_orient_w = _to_tensor(sp.global_orient_w)  # (F, 3)
+    body_pose_aa = _to_tensor(sp.body_pose_aa)         # (F, 63)
+    betas = _to_tensor(sp.betas)                       # (F, 10)
+    trans_c = _to_tensor(sp.trans)                      # (F, 3) incam
+    trans_w = _to_tensor(sp.global_trans)               # (F, 3) global
+
+    # --- 1. 生成 incam vertices ---
+    logger.info("[incam_global_gvhmr] Generating incam vertices via SMPL-X...")
+    smpl_params_incam = {
+        'global_orient': global_orient_c,
+        'body_pose': body_pose_aa,
+        'betas': betas,
+        'transl': trans_c,
+    }
+    with torch.no_grad():
+        smplx_out_c = smplx_model(**smpl_params_incam)
+        verts_incam = torch.stack([torch.matmul(smplx2smpl, v) for v in smplx_out_c.vertices])  # (F, V_smpl, 3)
+
+    # --- 2. 生成 global vertices ---
+    logger.info("[incam_global_gvhmr] Generating global vertices via SMPL-X...")
+    smpl_params_global = {
+        'global_orient': global_orient_w,
+        'body_pose': body_pose_aa,
+        'betas': betas,
+        'transl': trans_w,
+    }
+    with torch.no_grad():
+        smplx_out_w = smplx_model(**smpl_params_global)
+        pred_ay_verts = torch.stack([torch.matmul(smplx2smpl, v) for v in smplx_out_w.vertices])  # (F, V_smpl, 3)
+
+    # --- 3. move_to_start_point_face_z (和源库 demo 一致) ---
+    def move_to_start_point_face_z(verts):
+        """XZ to origin, Start from the ground, Face-Z"""
+        from einops import einsum as einops_einsum
+        verts = verts.clone()
+        offset = einops_einsum(J_regressor, verts[0], "j v, v i -> j i")[0]  # (3,)
+        offset[1] = verts[:, :, 1].min()
+        verts = verts - offset
+        # face direction
+        T_ay2ayfz = compute_T_ayfz2ay(
+            einops_einsum(J_regressor, verts[[0]], "j v, l v i -> l j i"),
+            inverse=True
+        )
+        verts = apply_T_on_points(verts, T_ay2ayfz)
+        return verts
+
+    verts_glob = move_to_start_point_face_z(pred_ay_verts)
+    joints_glob = torch.einsum('jv,fvi->fji', J_regressor, verts_glob)  # (F, J, 3)
+
+    # --- 4. 设置全局相机（和源库 demo 一致） ---
+    global_R, global_T, global_lights = get_global_cameras_static(
+        verts_glob.cpu(),
+        beta=2.0,
+        cam_height_degree=20,
+        target_center_height=1.0,
+    )
+
+    # 24mm 虚拟镜头
+    _, _, K_global = create_camera_sensor(W, H, 24)
+    global_renderer = GVHMRRenderer(W, H, device=device, faces=faces_smpl, K=K_global)
+
+    # 地面
+    scale, cx, cz = get_ground_params_from_points(joints_glob[:, 0].cpu(), verts_glob.cpu())
+    global_renderer.set_ground(scale * 1.5, cx, cz)
+
+    # --- 5. incam renderer（直接使用 camera_params 中的 K） ---
+    # 统一用一个 K：GVHMR 推理时已使用完整 GT K（与 GVHMR 官方评估一致），
+    # 所以 transl_c 和渲染用的 K 天然一致，无需任何备份/fallback。
+    K_fullimg = None
+    if data.camera_params and data.camera_params.intrinsics is not None:
+        K_cur = data.camera_params.intrinsics
+        if isinstance(K_cur, np.ndarray):
+            K_fullimg = torch.from_numpy(K_cur).float()
+        else:
+            K_fullimg = K_cur.float()
+        logger.info(f"[incam_global_gvhmr] Using camera_params K: "
+                    f"fx={float(K_fullimg[0,0]):.2f}, fy={float(K_fullimg[1,1]):.2f}, "
+                    f"cx={float(K_fullimg[0,2]):.2f}, cy={float(K_fullimg[1,2]):.2f}")
+    elif data.annotations and 'camera' in data.annotations:
+        gt_intr = data.annotations['camera'].get('intrinsics')
+        if gt_intr is not None:
+            if isinstance(gt_intr, np.ndarray):
+                K_fullimg = torch.from_numpy(gt_intr).float()
+            else:
+                K_fullimg = gt_intr.float()
+            logger.info(f"[incam_global_gvhmr] Using GT K from annotations: "
+                        f"fx={float(K_fullimg[0,0]):.2f}, fy={float(K_fullimg[1,1]):.2f}, "
+                        f"cx={float(K_fullimg[0,2]):.2f}, cy={float(K_fullimg[1,2]):.2f}")
+    if K_fullimg is None:
+        logger.warning("[incam_global_gvhmr] No K_fullimg found, using estimated focal length")
+        from hmr4d.utils.geo.hmr_cam import estimate_K
+        K_fullimg = estimate_K(W, H)
+
+    incam_renderer = GVHMRRenderer(W, H, device=device, faces=faces_smpl, K=K_fullimg)
+
+    # --- 6. 逐帧渲染并拼接 ---
+    # 确定渲染帧范围
+    frame_start = 0
+    frame_end = N
+    if frame_range is not None and len(frame_range) == 2:
+        frame_start = max(0, int(frame_range[0]))
+        frame_end = min(N, int(frame_range[1]))
+    logger.info(f"[incam_global_gvhmr] Rendering frames {frame_start}~{frame_end-1} (total {frame_end - frame_start} frames, output_subdir={output_subdir})...")
+    from tqdm import tqdm
+
+    color_global = torch.ones(3).float().to(device) * 0.8
+
+    for i in tqdm(range(frame_start, frame_end), desc="Rendering incam_global (gvhmr)"):
+        try:
+            # incam
+            img = cv2.imread(data.image_paths[i])
+            if img is None:
+                continue
+            img_incam = incam_renderer.render_mesh(
+                verts_incam[i].to(device), img.copy(), [0.8, 0.8, 0.8]
+            )
+
+            # global
+            cameras = global_renderer.create_camera(global_R[i], global_T[i])
+            img_global = global_renderer.render_with_ground(
+                verts_glob[[i]].to(device), color_global[None], cameras, global_lights
+            )
+
+            # 水平拼接
+            if img_incam.shape[:2] != img_global.shape[:2]:
+                img_global = cv2.resize(img_global, (img_incam.shape[1], img_incam.shape[0]))
+            merged = np.concatenate([img_incam, img_global], axis=1)
+
+            # 保存
+            frame_name = os.path.basename(data.image_paths[i])
+            output_path = os.path.join(vis_dir, frame_name)
+            cv2.imwrite(output_path, merged)
+
+        except Exception as e:
+            logger.warning(f"[incam_global_gvhmr] Failed to render frame {i}: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+            continue
+
+    # 清理 GPU 内存
+    del verts_incam, pred_ay_verts, verts_glob, smplx_model, smplx2smpl
+    del incam_renderer, global_renderer, J_regressor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    logger.info(f"[incam_global_gvhmr] Visualization saved to {vis_dir} ({N} frames)")
+
+
 def save_droid_debug_info(data: PipelineData):
     """
     保存 DROID-SLAM 的 frontend 调试信息摘要

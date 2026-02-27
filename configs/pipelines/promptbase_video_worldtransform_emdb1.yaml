@@ -1,0 +1,128 @@
+# PromptHMR + SLAM World Transform + Skating Removal Pipeline (EMDB1)
+#
+# 解决的问题：
+#   PromptHMR 视频头以 static_cam=True 运行时，输出的世界坐标不准确
+#   （没有输入真实相机角度）。本配置使用 SLAM 估计的相机外参，
+#   将 PromptHMR 的相机坐标系输出重新变换到世界坐标系。
+#
+# Pipeline 流程：
+#   1. Segmentation (SAM) - 人体分割
+#   2. SLAM (DROID) - 相机运动估计（提供 c2w 变换）
+#   3. HPE (PromptHMR) - 人体姿态估计（static_cam=True，输出 incam + 粗略 global）
+#   4. WorldTransform - 用 SLAM 相机参数将 incam SMPL 变换到准确的世界坐标系
+#   5. SkatingRemoval - 滑步消除（pp_static_joint + IK）
+#   6. Evaluation - 评估
+
+name: "PromptHMR + SLAM WorldTransform (EMDB1)"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/promptbase_video_skatingRemove_emdb1"
+
+components:
+  # 1. 人体分割
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. 相机运动估计（DROID-SLAM）
+  - type: slam
+    name: camera_estimation
+    backend: droid
+    use_masks: true
+    align_to_world: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # # 3. Camera Motion Estimation (使用 GT 相机参数)
+  # - type: slam
+  #   name: camera_estimation
+  #   backend: gt  # 使用 GT 相机后端
+  #   use_masks: true
+  #   align_to_world: true
+  #   cache:
+  #     enabled: false
+  #     use_cache: false
+  #     overwrite: true
+
+  # 3. PromptHMR HPE（static_cam=True，视频头不使用相机运动）
+  - type: hpe
+    name: gvhmr_preprocessing
+    backend: prompthmr
+    prompthmr_root: "../PromptHMR"
+    gvhmr_root: "thirdparty/GVHMR"
+    static_cam: true
+    f_mm: null
+    phmr_ckpt: "data/pretrain/phmr/checkpoint.ckpt"
+    phmr_vid_cfg: "data/pretrain/phmr_vid/prhmr_release_002.yaml"
+    phmr_vid_ckpt: "data/pretrain/phmr_vid/prhmr_release_002.ckpt"
+    mask_prompt: true
+    img_size: 896
+    use_mean_shape: true
+    substep_cache_use: true
+    substep_cache_overwrite: false
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 4. 世界坐标系变换（用 SLAM c2w 将 incam SMPL 转到世界坐标系）
+  - type: world_transform
+    name: world_transform
+    use_smooth_cam: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 5. 滑步消除
+  - type: skating_removal
+    name: skating_removal
+    gvhmr_root: "thirdparty/GVHMR"
+    enable_static_joint: true
+    enable_ik: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 6. 评估
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_gvhmr_preprocessing'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_worldtransform'
+      frame_range: [0, 5]
+
+  - stage: 'after_world_transform'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_post_worldtransform'
+      frame_range: [0, 5]
+
+  - stage: 'after_skating_removal'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_post_skating'
+      frame_range: [0, 5]

@@ -1,0 +1,84 @@
+# PromptHMR Base Pipeline (EMDB1 - InCam Evaluation)
+# 使用 PromptHMR 图像特征 + PromptHMR 视频头替代 GVHMR
+# EMDB1 仅评估 incam 指标（pa_mpjpe, mpjpe, pve, accel）
+#
+# Pipeline 流程：
+#   1. Segmentation (SAM) - 人体分割
+#   2. HPE (PromptHMR) - PromptHMR 推理（输出 global + incam 两套参数）
+#   3. SkatingRemoval - 滑步消除（pp_static_joint + IK）
+#   4. Evaluation - 评估指标（仅 incam）
+
+name: "PromptHMR Base Pipeline (EMDB1)"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/promptbase_emdb1"
+
+components:
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. PromptHMR Preprocessing (HPE)
+  - type: hpe
+    name: gvhmr_preprocessing
+    backend: prompthmr
+    prompthmr_root: "../PromptHMR"
+    gvhmr_root: "thirdparty/GVHMR"
+    static_cam: false #PromptHMR的video head是不包含相机变化的
+    f_mm: null
+    phmr_ckpt: "data/pretrain/phmr/checkpoint.ckpt"
+    phmr_vid_cfg: "data/pretrain/phmr_vid/prhmr_release_002.yaml"
+    phmr_vid_ckpt: "data/pretrain/phmr_vid/prhmr_release_002.ckpt"
+    mask_prompt: true
+    img_size: 896
+    use_mean_shape: true
+    # 子步骤缓存：VitPose + Image Model 结果缓存到磁盘
+    # substep_cache_dir 会自动设置为 output_dir/intermediate/<seq_name>
+    substep_cache_use: true        # 是否读取已有的子步骤缓存
+    substep_cache_overwrite: false  # 是否覆盖已有的子步骤缓存
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # # 3. Skating Removal (后处理)
+  # - type: skating_removal
+  #   name: skating_removal
+  #   gvhmr_root: "thirdparty/GVHMR"
+  #   enable_static_joint: true
+  #   enable_ik: true
+  #   device: "cuda"
+  #   cache:
+  #     enabled: true
+  #     use_cache: false
+  #     overwrite: true
+
+  # 4. Evaluation (EMDB1: incam metrics only)
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_gvhmr_preprocessing'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_skating'
+      frame_range: [0, 5]
+  - stage: 'after_skating_removal'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_post_skating'
+      frame_range: [0, 5]

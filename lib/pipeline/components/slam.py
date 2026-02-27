@@ -249,13 +249,26 @@ class SLAMComponent(BackendComponent):
                 "Ensure adjacent_smpl_renderer component runs before this component."
             )
 
-        # 获取关键帧信息（来自第一次 SLAM）
+        # 获取关键帧信息
+        # 优先使用第一次 SLAM 的关键帧（slam_keyframe_info），
+        # 如果没有第一次 SLAM（如 gvhmr_base pipeline），则从 adjacent_render_info 的
+        # rendered_indices 自动获取关键帧列表（所有渲染帧都作为 forced keyframes）
         keyframe_info = data.metadata.get('slam_keyframe_info')
         if keyframe_info is None:
-            raise ValueError(
-                "droid_warmstart backend requires slam_keyframe_info in metadata. "
-                "Ensure the first SLAM component has return_keyframe_info: true."
-            )
+            rendered_indices = adjacent_render_info.get('rendered_indices')
+            if rendered_indices is not None and len(rendered_indices) > 0:
+                self.logger.info(
+                    "No slam_keyframe_info found, using rendered_indices as forced keyframes "
+                    f"({len(rendered_indices)} frames)"
+                )
+                keyframe_info = {
+                    'keyframe_tstamps': rendered_indices,
+                }
+            else:
+                raise ValueError(
+                    "droid_warmstart backend requires either slam_keyframe_info or "
+                    "adjacent_render_info with rendered_indices in metadata."
+                )
 
         # 保存第一次 SLAM 的结果用于尺度对齐
         first_slam_cam_R = None

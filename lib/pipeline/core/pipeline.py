@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 import os
 
-from .data import PipelineData
+from .data import PipelineData, CameraParams
 from .component import Component
 
 
@@ -260,6 +260,9 @@ class Pipeline:
         合并原始数据和缓存数据
 
         保留原始输入数据（images、annotations等），同时加载缓存的处理结果。
+        对于 camera_params / gt_camera_params，做字段级合并而非整体覆盖，
+        避免缓存中只含部分字段（如 HPE 缓存只有内参）覆盖掉 SLAM 已设置的外参。
+        当存在冲突时（如内参），优先使用已有的 SLAM/GT 值。
 
         Args:
             original_data: 原始数据（包含输入）
@@ -282,9 +285,15 @@ class Pipeline:
 
         for field in fields_to_load:
             if hasattr(cached_data, field):
-                value = getattr(cached_data, field)
-                if value is not None:
-                    setattr(merged, field, value)
+                cached_value = getattr(cached_data, field)
+                if cached_value is not None:
+                    # 对 CameraParams 做字段级合并，避免缓存覆盖 SLAM 的外参
+                    if field in ('camera_params', 'gt_camera_params') and isinstance(cached_value, CameraParams):
+                        existing = getattr(merged, field)
+                        if existing is not None:
+                            self._merge_camera_params(existing, cached_value, field)
+                            continue
+                    setattr(merged, field, cached_value)
 
         # 合并 metadata（保留当前的关键配置）
         # 不要让缓存覆盖 output_dir、pipeline_name 等配置
@@ -297,6 +306,56 @@ class Pipeline:
         merged.metadata['cache_loaded_at'] = datetime.now().isoformat()
 
         return merged
+
+    def _merge_camera_params(self, existing: CameraParams, cached: CameraParams, field_name: str):
+        """
+        字段级合并 CameraParams：将缓存中的非 None 字段合并到已有对象上。
+
+        对于外参字段（R, T, world_R, world_T），已有值优先（来自 SLAM/GT），
+        缓存中的外参只在已有值为 None 时才填充。
+        对于内参字段（intrinsics, focal_length, principal_point），已有值优先（来自 SLAM/GT），
+        如果缓存值与已有值不同，输出警告日志并保留已有值。
+
+        Args:
+            existing: 已有的 CameraParams（来自之前的组件如 SLAM）
+            cached: 缓存中的 CameraParams（来自如 HPE 缓存）
+            field_name: 字段名（用于日志输出）
+        """
+        import numpy as np
+
+        # 外参字段：已有值优先，缓存只填充空位
+        extrinsic_fields = ['R', 'T', 'world_R', 'world_T']
+        for attr in extrinsic_fields:
+            cached_val = getattr(cached, attr, None)
+            existing_val = getattr(existing, attr, None)
+            if cached_val is not None and existing_val is None:
+                setattr(existing, attr, cached_val)
+                self.logger.debug(f"[{field_name}] Filled {attr} from cache")
+
+        # 内参字段：已有值优先（来自 SLAM/GT），冲突时保留已有值并输出日志
+        intrinsic_fields = ['intrinsics', 'focal_length', 'principal_point']
+        for attr in intrinsic_fields:
+            cached_val = getattr(cached, attr, None)
+            existing_val = getattr(existing, attr, None)
+            if cached_val is not None:
+                if existing_val is None:
+                    # 已有值为空，从缓存填充
+                    setattr(existing, attr, cached_val)
+                    self.logger.debug(f"[{field_name}] Filled {attr} from cache")
+                else:
+                    # 两者都有值，检查是否冲突
+                    conflict = False
+                    if isinstance(existing_val, np.ndarray) and isinstance(cached_val, np.ndarray):
+                        conflict = not np.allclose(existing_val, cached_val, atol=1e-4)
+                    elif isinstance(existing_val, (int, float)) and isinstance(cached_val, (int, float)):
+                        conflict = abs(existing_val - cached_val) > 1e-4
+                    if conflict:
+                        self.logger.info(
+                            f"[{field_name}] Intrinsic field '{attr}' conflict: "
+                            f"keeping existing (from SLAM/GT), discarding cached (from HPE). "
+                            f"existing={existing_val}, cached={cached_val}"
+                        )
+                    # 保留已有值，不覆盖
 
     def _get_cache_dir(self, data: PipelineData) -> str:
         """获取缓存目录路径"""

@@ -1,0 +1,120 @@
+# PromptHMR Base Pipeline (EMDB1 - InCam Evaluation)
+# 使用 PromptHMR 图像特征 + PromptHMR 视频头替代 GVHMR
+# EMDB1 仅评估 incam 指标（pa_mpjpe, mpjpe, pve, accel）
+#
+# Pipeline 流程：
+#   1. Segmentation (SAM) - 人体分割
+#   2. HPE (PromptHMR) - PromptHMR 推理（输出 global + incam 两套参数）
+#   3. SkatingRemoval - 滑步消除（pp_static_joint + IK）
+#   4. Evaluation - 评估指标（仅 incam）
+
+name: "PromptHMR Base Pipeline (EMDB1)"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/promptbase_video_skatingRemove_emdb1"
+
+components:
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # - type: slam
+  #   name: camera_estimation
+  #   backend: droid
+  #   use_masks: true
+  #   align_to_world: true
+  #   return_keyframe_info: true  # 额外返回 keyframe_tstamps、poses、disps
+  #   cache:
+  #     enabled: true
+  #     use_cache: true
+  #     overwrite: false  # 总是覆盖缓存，确保 keyframe_info 是最新的
+
+  # 3. Camera Motion Estimation (使用 GT 相机参数)
+  - type: slam
+    name: camera_estimation
+    backend: gt  # 使用 GT 相机后端
+    use_masks: true
+    align_to_world: true
+    cache:
+      enabled: false
+      use_cache: false
+      overwrite: true
+
+  # 2. PromptHMR Preprocessing (HPE)
+  - type: hpe
+    name: gvhmr_preprocessing
+    backend: prompthmr
+    prompthmr_root: "../PromptHMR"
+    gvhmr_root: "thirdparty/GVHMR"
+    static_cam: true #PromptHMR的video head是不包含相机变化的
+    f_mm: null
+    phmr_ckpt: "data/pretrain/phmr/checkpoint.ckpt"
+    phmr_vid_cfg: "data/pretrain/phmr_vid/prhmr_release_002.yaml"
+    phmr_vid_ckpt: "data/pretrain/phmr_vid/prhmr_release_002.ckpt"
+    mask_prompt: true
+    img_size: 896
+    use_mean_shape: true
+    # 子步骤缓存：VitPose + Image Model 结果缓存到磁盘
+    # substep_cache_dir 会自动设置为 output_dir/intermediate/<seq_name>
+    substep_cache_use: true        # 是否读取已有的子步骤缓存
+    substep_cache_overwrite: false  # 是否覆盖已有的子步骤缓存
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  #添加这个会影响eval
+  # 5. Adjacent Frame SMPL Rendering
+  - type: adjacent_smpl_renderer
+    name: adjacent_frame_rendering
+    pre_dis: 5
+    num_adjacent_frames: 2
+    device: "cuda"
+    render_mode: "world"  # GT 模式：直接使用世界坐标系 trans 渲染，避免 Y 轴偏移
+    cache:
+      enabled: true
+      use_cache: false  # 设为 true 时直接读取 adjacent_smpl 目录的图片
+      overwrite: true   # 设为 true 时删除原目录下所有图片再重新渲染
+
+
+  # 3. Skating Removal (后处理)
+  - type: skating_removal
+    name: skating_removal
+    gvhmr_root: "thirdparty/GVHMR"
+    enable_static_joint: true
+    enable_ik: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 4. Evaluation (EMDB1: incam metrics only)
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_gvhmr_preprocessing'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_skating'
+      frame_range: [0, 5]
+  - stage: 'after_skating_removal'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_post_skating'
+      frame_range: [0, 5]

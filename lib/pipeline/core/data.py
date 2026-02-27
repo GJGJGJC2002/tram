@@ -194,9 +194,12 @@ class PipelineData:
             elif 'camera' in stage or 'slam' in stage:
                 data['camera_params'] = self.camera_params.to_dict() if self.camera_params else None
                 data['gt_camera_params'] = self.gt_camera_params.to_dict() if self.gt_camera_params else None
-            elif 'hpe' in stage:
+            elif 'hpe' in stage or 'preprocessing' in stage or 'skating' in stage:
+                # 匹配 HPE 组件（如 "gvhmr_preprocessing"）和后处理组件（如 "skating_removal"）
                 data['smpl_params'] = self.smpl_params.to_dict() if self.smpl_params else None
                 data['gt_smpl_params'] = self.gt_smpl_params.to_dict() if self.gt_smpl_params else None
+                # HPE 组件也会设置 camera_params（内参），需要一并保存
+                data['camera_params'] = self.camera_params.to_dict() if self.camera_params else None
             else:
                 # 未知阶段，保存所有字段（安全回退）
                 data['bboxes'] = self.bboxes

@@ -27,6 +27,8 @@ from tqdm import tqdm
 from lib.pipeline.core.component import Component
 from lib.pipeline.core.data import PipelineData
 from lib.models.smpl import SMPL
+from pytorch3d.renderer import TexturesVertex, Materials
+from pytorch3d.structures import Meshes
 
 
 class AdjacentSMPLRenderer(Component):
@@ -58,6 +60,8 @@ class AdjacentSMPLRenderer(Component):
         'mesh_color_mode': 'colorful',  # 'colorful' (每帧不同彩色) 或 'uniform' (统一灰白色)
         'uniform_mesh_color': [0.75, 0.75, 0.75],  # mesh_color_mode='uniform' 时使用的 RGB 颜色 [0-1]
         'gvhmr_root': 'thirdparty/GVHMR',  # gvhmr_world 模式需要的 GVHMR 根目录
+        'mesh_render_style': 'solid',  # 'solid' (实心填充) 或 'contour' (只画轮廓边缘，保留背景纹理)
+        'contour_thickness': 3,  # contour 模式下轮廓线宽度（像素），值越大轮廓越粗
     }
 
     def __init__(self, name: str, config: Dict[str, Any] = None):
@@ -74,6 +78,8 @@ class AdjacentSMPLRenderer(Component):
         self.mesh_color_mode = self.config['mesh_color_mode']
         self.uniform_mesh_color = self.config['uniform_mesh_color']
         self.gvhmr_root = self.config.get('gvhmr_root', 'thirdparty/GVHMR')
+        self.mesh_render_style = self.config.get('mesh_render_style', 'solid')
+        self.contour_thickness = self.config.get('contour_thickness', 3)
 
         # SMPL模型和faces
         self.smpl_model = None
@@ -123,6 +129,80 @@ class AdjacentSMPLRenderer(Component):
             return self.uniform_mesh_color
         else:
             return self.frame_colors[frame_idx]
+
+    def _render_contour(self, renderer, vertices, background, colors, thickness=3):
+        """渲染 mesh 的轮廓边缘（不填充实心区域），保留背景纹理
+
+        原理：
+        1. 用标准 render_mesh 渲染获得实心 mask
+        2. 对 mask 做膨胀-腐蚀差分提取边缘轮廓
+        3. 只在边缘像素位置用指定颜色覆盖原始背景
+
+        Args:
+            renderer: GVHMRRenderer 实例
+            vertices: (V, 3) 相机坐标系下的 mesh vertices
+            background: (H, W, 3) BGR 背景图像
+            colors: RGB 颜色 [r, g, b]，范围 [0, 1]
+            thickness: 轮廓线宽度（像素）
+
+        Returns:
+            叠加了轮廓线的背景图像
+        """
+        # Step 1: 渲染实心 mesh 获取 silhouette mask
+        renderer.update_bbox(vertices[::50], scale=1.2)
+        verts = vertices.unsqueeze(0)
+
+        colors_normalized = colors
+        if isinstance(colors_normalized, list) and len(colors_normalized) > 0 and colors_normalized[0] > 1:
+            colors_normalized = [c / 255.0 for c in colors_normalized]
+
+        verts_features = torch.tensor(colors_normalized).reshape(1, 1, 3).to(
+            device=verts.device, dtype=verts.dtype)
+        verts_features = verts_features.repeat(1, verts.shape[1], 1)
+        textures = TexturesVertex(verts_features=verts_features)
+
+        mesh = Meshes(verts=verts, faces=renderer.faces, textures=textures)
+        materials = Materials(device=renderer.device,
+                              specular_color=(colors_normalized,), shininess=0)
+
+        results = torch.flip(
+            renderer.renderer(mesh, materials=materials,
+                              cameras=renderer.cameras, lights=renderer.lights),
+            [1, 2]
+        )
+
+        # 获取 mask 和 bbox
+        mask_full = (results[0, ..., -1] > 1e-3).cpu().numpy().astype(np.uint8)
+        bbox = renderer.bboxes[0].int().cpu().numpy()
+        x1, y1, x2, y2 = bbox[0], bbox[1], bbox[2], bbox[3]
+
+        # Step 2: 在 bbox 区域内提取轮廓（膨胀 - 腐蚀 = 边缘带）
+        mask_roi = mask_full[:y2 - y1, :x2 - x1]
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thickness * 2 + 1, thickness * 2 + 1))
+        dilated = cv2.dilate(mask_roi, kernel, iterations=1)
+        eroded = cv2.erode(mask_roi, kernel, iterations=1)
+        contour_mask = ((dilated - eroded) > 0)
+
+        # Step 3: 在轮廓位置叠加颜色到背景上
+        output = background.copy()
+        roi = output[y1:y2, x1:x2]
+
+        # RGB [0,1] -> BGR [0,255]
+        color_bgr = [int(colors_normalized[2] * 255),
+                     int(colors_normalized[1] * 255),
+                     int(colors_normalized[0] * 255)]
+
+        h_roi, w_roi = roi.shape[:2]
+        h_mask, w_mask = contour_mask.shape[:2]
+        h_use = min(h_roi, h_mask)
+        w_use = min(w_roi, w_mask)
+
+        contour_crop = contour_mask[:h_use, :w_use]
+        roi[:h_use, :w_use][contour_crop] = color_bgr
+        output[y1:y2, x1:x2] = roi
+
+        renderer.reset_bbox()
+        return output
 
     def validate_input(self, data: PipelineData) -> bool:
         """验证输入"""
@@ -310,7 +390,14 @@ class AdjacentSMPLRenderer(Component):
                         verts_world = torch.einsum('ij,vj->vi', R_c2w_j, verts_j) + t_c2w_j
                         verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_world) + t_w2c_i
 
-                    final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx))
+                    if self.mesh_render_style == 'contour':
+                        final_img = self._render_contour(
+                            render, verts_in_cam_i, final_img,
+                            colors=self._get_mesh_color(frame_idx),
+                            thickness=self.contour_thickness
+                        )
+                    else:
+                        final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx))
 
             output_path = os.path.join(output_dir, img_name)
             cv2.imwrite(output_path, final_img)
@@ -433,7 +520,14 @@ class AdjacentSMPLRenderer(Component):
                     # 世界坐标系 -> 当前帧相机坐标系: p_cam = R_w2c @ p_world + t_w2c
                     verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_w) + t_w2c_i
 
-                    final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx))
+                    if self.mesh_render_style == 'contour':
+                        final_img = self._render_contour(
+                            render, verts_in_cam_i, final_img,
+                            colors=self._get_mesh_color(frame_idx),
+                            thickness=self.contour_thickness
+                        )
+                    else:
+                        final_img = render.render_mesh(verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx))
 
             output_path = os.path.join(output_dir, img_name)
             cv2.imwrite(output_path, final_img)
@@ -447,26 +541,30 @@ class AdjacentSMPLRenderer(Component):
         """GVHMR 世界坐标系模式渲染
 
         策略：从 GVHMR 的 global+incam 两套输出反推每帧的 T_w2c（世界到相机的变换矩阵），
-        使用修正后（滑步消除后）的全局 SMPL 参数生成世界坐标系下的 vertices，
+        使用 GVHMR 原生的 SMPL-X 模型生成世界坐标系下的 vertices（通过 smplx2smpl 转换），
         再用原始的 T_w2c 投影到中心帧的相机视角下渲染。
 
         关键公式（来自 GVHMR 的 get_T_w2c_from_wcparams）：
             R_w2c = R_c @ R_w^T
             t_w2c = t_c + offset - R_w2c @ (t_w + offset)
 
-        注意：T_w2c 使用滑步修正前的 global 参数（transl_w_raw）反推，
-        因为 incam 参数未被修正，这样才能保证 T_w2c 的精确性。
-        渲染时使用修正后的全局 vertices。
+        注意：
+        - T_w2c 使用滑步修正前的 global 参数（transl_w_raw）反推，
+          因为 incam 参数未被修正，这样才能保证 T_w2c 的精确性。
+        - 使用 GVHMR 原生的 SMPL-X 模型 (make_smplx("supermotion")) + smplx2smpl
+          转换，与 hooks 中 incam 渲染保持一致，避免 SMPL vs SMPL-X 参数空间不兼容。
+        - 使用 GVHMRRenderer（支持完整 K 矩阵），避免只取 fx 丢失 cx/cy 导致像素偏移。
 
         完全不需要外部 SLAM 的相机参数。
         """
         import sys
-        from lib.vis.renderer import Renderer
 
         gvhmr_abs = os.path.abspath(self.gvhmr_root)
         if gvhmr_abs not in sys.path:
             sys.path.insert(0, gvhmr_abs)
         from hmr4d.utils.geo.hmr_global import get_T_w2c_from_wcparams
+        from hmr4d.utils.smplx_utils import make_smplx
+        from hmr4d.utils.vis.renderer import Renderer as GVHMRRenderer
 
         # 获取图像路径
         if hasattr(data, 'image_paths'):
@@ -478,11 +576,23 @@ class AdjacentSMPLRenderer(Component):
         first_img = cv2.imread(img_paths[0])
         H, W = first_img.shape[:2]
 
-        # 获取相机内参
-        intrinsics = self._get_intrinsics(data)
-        if intrinsics is None:
+        # 获取相机内参（完整 K 矩阵）
+        K_fullimg = None
+        if data.camera_params and data.camera_params.intrinsics is not None:
+            K_fullimg = data.camera_params.intrinsics
+            if isinstance(K_fullimg, np.ndarray):
+                K_fullimg = torch.from_numpy(K_fullimg).float()
+        if K_fullimg is None:
+            # fallback: 从 annotations 获取
+            intrinsics = self._get_intrinsics(data)
+            if intrinsics is not None:
+                if isinstance(intrinsics, np.ndarray):
+                    K_fullimg = torch.from_numpy(intrinsics).float()
+                else:
+                    K_fullimg = intrinsics.float()
+        if K_fullimg is None:
+            self.logger.error("No camera intrinsics found for gvhmr_world mode")
             return data
-        focal_length = float(intrinsics[0, 0])
 
         # 获取 GVHMR 参数
         sp = data.smpl_params
@@ -496,24 +606,29 @@ class AdjacentSMPLRenderer(Component):
         global_orient_w = sp.global_orient_w  # (F, 3) axis-angle
         global_orient_c = sp.global_orient_c  # (F, 3) axis-angle
         transl_w_raw = sp.transl_w_raw  # (F, 3) 滑步修正前的 world transl
+        global_trans = sp.global_trans  # (F, 3) 滑步修正后的 world transl
         transl_c = sp.trans  # (F, 3) incam transl
         skeleton_offset = sp.skeleton_offset  # (3,) root joint offset
 
         # 修正后的参数（经过 SkatingRemoval）
-        transl_w_fixed = sp.global_trans  # (F, 3) 修正后的 world transl
         body_pose_fixed = sp.body_pose_aa  # (F, 63) 修正后的 body pose
         betas = sp.betas  # (F, 10)
 
         # 确保在正确的 device 上
         device = torch.device(self.device)
 
-        # --- 1. 反推 T_w2c（使用原始的 global 参数 + incam 参数） ---
+        # --- 1. 反推 T_w2c（使用修正后的 global_trans + incam 参数） ---
+        def _to_tensor(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float().to(device)
+            return x.float().to(device)
+
         T_w2c = get_T_w2c_from_wcparams(
-            global_orient_w.to(device),
-            transl_w_raw.to(device),
-            global_orient_c.to(device),
-            transl_c.to(device),
-            skeleton_offset.to(device),
+            _to_tensor(global_orient_w),
+            _to_tensor(global_trans),
+            _to_tensor(global_orient_c),
+            _to_tensor(transl_c),
+            _to_tensor(skeleton_offset),
         )  # (F, 4, 4)
 
         self.logger.info(f"[gvhmr_world mode] Computed T_w2c: {T_w2c.shape}")
@@ -521,14 +636,35 @@ class AdjacentSMPLRenderer(Component):
         R_w2c = T_w2c[:, :3, :3].cpu().numpy()  # (F, 3, 3)
         t_w2c = T_w2c[:, :3, 3].cpu().numpy()  # (F, 3)
 
-        # --- 2. 使用修正后的全局参数生成世界坐标系下的 vertices ---
-        vertices_world = self._generate_vertices_gvhmr(
-            global_orient_w, body_pose_fixed, betas, transl_w_fixed
-        )
-        self.logger.info(f"Generated vertices: {vertices_world.shape} (world coords, post-correction)")
+        # --- 2. 使用 SMPL-X 模型生成世界坐标系下的 vertices ---
+        # 使用 GVHMR 原生的 SMPL-X 模型，与 hooks 中 incam 渲染保持一致
+        self.logger.info("[gvhmr_world mode] Loading SMPL-X model (supermotion)...")
+        smplx_model = make_smplx("supermotion").to(device)
+        smplx2smpl = torch.load(
+            os.path.join(gvhmr_abs, "hmr4d/utils/body_model/smplx2smpl_sparse.pt")
+        ).to(device)
+        faces_smpl = make_smplx("smpl").faces
 
-        # --- 3. 渲染 ---
-        render = Renderer(W, H, focal_length, self.device, self.smpl_faces)
+        smpl_params_world = {
+            'global_orient': _to_tensor(global_orient_w),
+            'body_pose': _to_tensor(body_pose_fixed),
+            'betas': _to_tensor(betas),
+            'transl': _to_tensor(global_trans),
+        }
+        with torch.no_grad():
+            smplx_out_w = smplx_model(**smpl_params_world)
+            # SMPL-X vertices -> SMPL vertices (通过 smplx2smpl 稀疏矩阵)
+            vertices_world = torch.stack(
+                [torch.matmul(smplx2smpl, v) for v in smplx_out_w.vertices]
+            )  # (F, V_smpl, 3)
+
+        self.logger.info(
+            f"Generated vertices via SMPL-X: {vertices_world.shape} "
+            f"(world coords, using global_trans for skating-corrected rendering)"
+        )
+
+        # --- 3. 渲染（使用 GVHMRRenderer + 完整 K 矩阵） ---
+        render = GVHMRRenderer(W, H, device=device, faces=faces_smpl, K=K_fullimg)
         self.frame_colors = self._generate_frame_colors(N)
         output_dir = self._get_output_dir(data)
         rendered_indices = list(range(0, N, self.pre_dis))
@@ -542,23 +678,35 @@ class AdjacentSMPLRenderer(Component):
             img_name = os.path.basename(img_paths[i])
 
             # 当前帧的 w2c
-            R_w2c_i = torch.from_numpy(R_w2c[i]).float().to(self.device)
-            t_w2c_i = torch.from_numpy(t_w2c[i]).float().to(self.device)
+            R_w2c_i = torch.from_numpy(R_w2c[i]).float().to(device)
+            t_w2c_i = torch.from_numpy(t_w2c[i]).float().to(device)
 
             for offset in range(-self.num_adjacent_frames * self.pre_dis,
                                 self.num_adjacent_frames * self.pre_dis + 1,
                                 self.pre_dis):
                 frame_idx = i + offset
                 if 0 <= frame_idx < N:
-                    verts_w = torch.tensor(vertices_world[frame_idx]).float().to(self.device)
+                    verts_w = vertices_world[frame_idx].to(device)
                     # world -> cam_i: p_cam = R_w2c_i @ p_world + t_w2c_i
                     verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_w) + t_w2c_i
-                    final_img = render.render_mesh(
-                        verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx)
-                    )
+                    if self.mesh_render_style == 'contour':
+                        final_img = self._render_contour(
+                            render, verts_in_cam_i, final_img,
+                            colors=self._get_mesh_color(frame_idx),
+                            thickness=self.contour_thickness
+                        )
+                    else:
+                        final_img = render.render_mesh(
+                            verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx)
+                        )
 
             output_path = os.path.join(output_dir, img_name)
             cv2.imwrite(output_path, final_img)
+
+        # 释放 SMPL-X 模型（gvhmr_world 专用，不影响 self.smpl_model）
+        del smplx_model, smplx2smpl
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self._log_render_summary(rendered_indices, N, last_frame_saved, output_dir)
         self._save_render_info(data, N, rendered_indices, last_frame_saved, output_dir)
@@ -675,7 +823,14 @@ class AdjacentSMPLRenderer(Component):
                             verts_world = torch.einsum('ij,vj->vi', R_c2w_j, verts) + t_c2w_j
                             verts_in_cam = torch.einsum('ij,vj->vi', R_w2c_i, verts_world) + t_w2c_i
 
-                    final_img = render.render_mesh(verts_in_cam, final_img, colors=self._get_mesh_color(frame_idx))
+                    if self.mesh_render_style == 'contour':
+                        final_img = self._render_contour(
+                            render, verts_in_cam, final_img,
+                            colors=self._get_mesh_color(frame_idx),
+                            thickness=self.contour_thickness
+                        )
+                    else:
+                        final_img = render.render_mesh(verts_in_cam, final_img, colors=self._get_mesh_color(frame_idx))
             else:
                 # 非关键帧（仅当 render_only=False 时才会进入此分支）
                 if masks is not None:

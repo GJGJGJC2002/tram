@@ -1,5 +1,6 @@
 """HPEComponent - 人体姿态估计组件"""
 
+import os
 from typing import Dict, Any
 import numpy as np
 import torch
@@ -8,6 +9,8 @@ from lib.pipeline.core.component import BackendComponent
 from lib.pipeline.core.data import PipelineData, SMPLParams
 from lib.pipeline.backends.hpe import VIMOBackend, GTSmplBackend
 from lib.pipeline.backends.hpe.gvhmr import GVHMRBackend
+from lib.pipeline.backends.hpe.prompthmr import PromptHMRBackend
+from lib.pipeline.backends.hpe.prompthmr_imgonly import PromptHMRImgOnlyBackend
 
 
 class HPEComponent(BackendComponent):
@@ -17,7 +20,7 @@ class HPEComponent(BackendComponent):
     从图像序列中估计 SMPL 人体模型参数。
     
     Config:
-        backend: HPE 后端类型 ('vimo', 'gt', 'gvhmr')
+        backend: HPE 后端类型 ('vimo', 'gt', 'gvhmr', 'prompthmr', 'prompthmr_imgonly')
         mode: 估计模式 ('accurate', 'efficient')
         use_mean_shape: 是否使用平均形状参数
     """
@@ -28,6 +31,8 @@ class HPEComponent(BackendComponent):
         'vimo': VIMOBackend,
         'gt': GTSmplBackend,
         'gvhmr': GVHMRBackend,
+        'prompthmr': PromptHMRBackend,
+        'prompthmr_imgonly': PromptHMRImgOnlyBackend,
     }
     
     DEFAULT_BACKEND = 'vimo'
@@ -132,6 +137,10 @@ class HPEComponent(BackendComponent):
             return self._execute_gt(data)
         elif self.backend_type == 'gvhmr':
             return self._execute_gvhmr(data)
+        elif self.backend_type == 'prompthmr':
+            return self._execute_gvhmr(data)  # 输出格式与 GVHMR 完全一致，复用同一处理逻辑
+        elif self.backend_type == 'prompthmr_imgonly':
+            return self._execute_prompthmr_imgonly(data)
         else:
             return self._execute_vimo(data)
 
@@ -320,14 +329,35 @@ class HPEComponent(BackendComponent):
         # 获取相机参数
         img_focal, img_center = self._get_camera_params(data)
 
+        # 尝试从 GT annotations 中获取完整的 K 矩阵，直接传给 GVHMR
+        # 这与 GVHMR 官方评估 EMDB 时的做法一致（直接用 GT K 作为 K_fullimg）
+        gt_K_matrix = None
+        if data.annotations is not None and 'camera' in data.annotations:
+            gt_intrinsics = data.annotations['camera'].get('intrinsics')
+            if gt_intrinsics is not None:
+                gt_K_matrix = gt_intrinsics  # 完整的 3x3 K 矩阵
+                self.logger.info(
+                    f"Using GT K matrix for GVHMR: "
+                    f"fx={float(gt_intrinsics[0, 0]):.2f}, fy={float(gt_intrinsics[1, 1]):.2f}, "
+                    f"cx={float(gt_intrinsics[0, 2]):.2f}, cy={float(gt_intrinsics[1, 2]):.2f}"
+                )
+
         self.logger.info("Running GVHMR inference...")
+
+        # 为 PromptHMR 后端设置子步骤缓存目录（基于当前序列的输出目录）
+        if self.backend_type == 'prompthmr' and hasattr(self.backend, 'substep_cache_dir'):
+            output_dir = data.metadata.get('output_dir', '')
+            seq_name = data.sequence_name or 'unnamed'
+            substep_dir = os.path.join(output_dir, 'intermediate', seq_name)
+            self.backend.substep_cache_dir = substep_dir
 
         # 调用 GVHMR 后端
         gvhmr_results = self.backend.estimate_smpl(
             image_paths=data.image_paths,
             bboxes=data.bboxes,
-            img_focal=img_focal,
+            img_focal=img_focal if gt_K_matrix is None else None,
             img_center=img_center,
+            K_fullimg_override=gt_K_matrix,
         )
 
         # 解包 GVHMR 输出
@@ -391,14 +421,105 @@ class HPEComponent(BackendComponent):
                 focal_length=float(K_fullimg[0, 0, 0]),
             )
 
+        # 保存 ViTPose 2D 关键点到 metadata（供 OAR 等后续组件使用）
+        if 'vitpose_kp2d' in gvhmr_results and gvhmr_results['vitpose_kp2d'] is not None:
+            data.metadata['vitpose_kp2d'] = gvhmr_results['vitpose_kp2d']  # (N, 17, 3)
+            self.logger.info(f"Saved ViTPose 2D keypoints: {gvhmr_results['vitpose_kp2d'].shape}")
+
         # 记录元数据
         data.metadata['hpe_stats'] = {
             'num_frames': num_frames,
-            'backend': 'gvhmr',
+            'backend': self.backend_type,
             'use_mean_shape': self.use_mean_shape,
         }
 
-        self.logger.info(f"GVHMR estimation completed for {num_frames} frames")
+        self.logger.info(f"{self.backend_type.upper()} estimation completed for {num_frames} frames")
+        return data
+
+    def _execute_prompthmr_imgonly(self, data: PipelineData) -> PipelineData:
+        """使用 PromptHMR 图像模型后端执行（不经过视频头，与官方评估一致）"""
+        # 帧采样
+        self._sample_frames(data)
+
+        # 获取相机参数
+        img_focal, img_center = self._get_camera_params(data)
+
+        # GT K 矩阵
+        gt_K_matrix = None
+        if data.annotations is not None and 'camera' in data.annotations:
+            gt_intrinsics = data.annotations['camera'].get('intrinsics')
+            if gt_intrinsics is not None:
+                gt_K_matrix = gt_intrinsics
+                self.logger.info(
+                    f"Using GT K matrix: "
+                    f"fx={float(gt_intrinsics[0, 0]):.2f}, fy={float(gt_intrinsics[1, 1]):.2f}"
+                )
+
+        # 为后端设置子步骤缓存目录
+        if hasattr(self.backend, 'substep_cache_dir'):
+            output_dir = data.metadata.get('output_dir', '')
+            seq_name = data.sequence_name or 'unnamed'
+            substep_dir = os.path.join(output_dir, 'intermediate', seq_name)
+            self.backend.substep_cache_dir = substep_dir
+
+        self.logger.info("Running PromptHMR image-only inference...")
+
+        results = self.backend.estimate_smpl(
+            image_paths=data.image_paths,
+            bboxes=data.bboxes,
+            img_focal=img_focal if gt_K_matrix is None else None,
+            img_center=img_center,
+            K_fullimg_override=gt_K_matrix,
+        )
+
+        # 解包结果
+        smpl_verts = results['smpl_vertices']   # (N, 6890, 3)
+        smpl_j3d = results['smpl_j3d']          # (N, 24, 3)
+        j_regressor = results['j_regressor']    # (24, 6890)
+        rotmat = results['rotmat']              # (N, 22, 3, 3)
+        betas = results['betas']                # (N, 10)
+        transl = results['transl']              # (N, 3)
+        K_fullimg = results['K_fullimg']        # (N, 3, 3)
+
+        # 使用平均 shape
+        if self.use_mean_shape:
+            mean_betas = betas.mean(dim=0, keepdim=True)
+            betas = mean_betas.repeat(len(betas), 1)
+
+        num_frames = len(smpl_verts)
+
+        # 创建 SMPLParams（图像模型路径：直接存 SMPL vertices 和 joints）
+        data.smpl_params = SMPLParams(
+            betas=betas,
+            trans=transl,
+            rotmat=rotmat,
+            # 存储预计算的 vertices/joints（避免 evaluation 重新 forward）
+            vertices=smpl_verts,
+            joints=smpl_j3d,
+        )
+
+        # 标记为 prompthmr_imgonly 路径，evaluation 会使用预计算的 vertices/joints
+        data.metadata['hpe_backend'] = 'prompthmr_imgonly'
+        data.metadata['j_regressor_source'] = 'smpl.J_regressor[:24]'
+
+        # 存储 J_regressor 供 evaluation 使用（GT 也需要用相同的 regressor）
+        data.metadata['phmr_j_regressor'] = j_regressor
+
+        # 存储相机内参
+        if data.camera_params is None:
+            from lib.pipeline.core.data import CameraParams
+            data.camera_params = CameraParams(
+                intrinsics=K_fullimg[0].numpy() if isinstance(K_fullimg, torch.Tensor) else K_fullimg[0],
+                focal_length=float(K_fullimg[0, 0, 0]),
+            )
+
+        data.metadata['hpe_stats'] = {
+            'num_frames': num_frames,
+            'backend': self.backend_type,
+            'use_mean_shape': self.use_mean_shape,
+        }
+
+        self.logger.info(f"PromptHMR img-only estimation completed for {num_frames} frames")
         return data
 
     def _get_camera_params(self, data: PipelineData):

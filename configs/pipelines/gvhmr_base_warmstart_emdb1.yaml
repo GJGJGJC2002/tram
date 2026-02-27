@@ -1,0 +1,123 @@
+# GVHMR Base + Warmstart Pipeline (EMDB1 - InCam Evaluation)
+# 基于 gvhmr_base，第 6 步替换为 droid_warmstart
+# EMDB1 仅评估 incam 指标（pa_mpjpe, mpjpe, pve, accel），不包含全局运动指标
+#
+# Pipeline 流程：
+#   1. Detection (VitDet) - 人体检测
+#   2. Segmentation (SAM) - 人体分割
+#   3. HPE (GVHMR) - GVHMR 推理（输出 global + incam 两套参数）
+#   4. SkatingRemoval - 滑步消除（pp_static_joint + IK）
+#   5. AdjacentSMPLRenderer (gvhmr_world) - 用 GVHMR 自带的 T_w2c 渲染邻帧 SMPL
+#   6. SLAM (droid_warmstart) - 使用渲染帧索引作为 forced keyframes + warmstart 策略
+#   7. Evaluation - 评估指标（仅 incam）
+
+name: "GVHMR Base + Warmstart Pipeline (EMDB1)"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/gvhmr_base_warmstart_emdb1"
+
+components:
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 3. GVHMR Preprocessing (HPE)
+  - type: hpe
+    name: gvhmr_preprocessing
+    backend: gvhmr
+    gvhmr_root: "thirdparty/GVHMR"
+    static_cam: false
+    f_mm: null
+    vo_method: "sift"
+    use_mean_shape: true
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 4. Skating Removal (后处理)
+  - type: skating_removal
+    name: skating_removal
+    gvhmr_root: "thirdparty/GVHMR"
+    enable_static_joint: true
+    enable_ik: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # # 5. Adjacent Frame SMPL Rendering (gvhmr_world mode)
+  # - type: adjacent_smpl_renderer
+  #   name: adjacent_frame_rendering
+  #   pre_dis: 5
+  #   num_adjacent_frames: 1
+  #   device: "cuda"
+  #   render_mode: "gvhmr_world"
+  #   frame_selection_mode: "uniform"
+  #   mesh_color_mode: "colorful"
+  #   uniform_mesh_color: [0.75, 0.75, 0.75]
+  #   mesh_render_style: "solid"  # 'solid' (实心填充) 或 'contour' (只画轮廓边缘，保留背景纹理)
+  #   contour_thickness: 3  # contour 模式下轮廓线宽度（像素）
+  #   gvhmr_root: "thirdparty/GVHMR"
+  #   cache:
+  #     enabled: true
+  #     use_cache: false
+  #     overwrite: true
+
+  # # 6. SLAM Warmstart (使用 rendered_indices 作为 forced keyframes)
+  # # 无需第一次 SLAM，自动从 adjacent_render_info 获取关键帧列表
+  # - type: slam
+  #   name: camera_estimation_warmstart
+  #   backend: droid_warmstart
+  #   use_masks: true  # 此 pipeline 没有 segmentation 步骤，data.masks 为 None
+  #   align_to_world: true
+  #   image_dir: null  # 自动从 adjacent_render_info 获取
+  #   enable_scale_alignment: false  # 无第一次 SLAM，不做尺度对齐
+  #   use_warmstart_poses: false
+  #   use_rendered_for_keyframes: true  # 关键帧使用渲染图像（带 SMPL mesh）
+  #   keyframe_render_mode: "adaptive"  # 所有关键帧（即所有渲染帧）都使用渲染图像
+  #   texture_threshold: 1.0
+  #   cache:
+  #     enabled: true
+  #     use_cache: false
+  #     overwrite: true
+  
+  # 7. Evaluation (EMDB1: incam metrics only)
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_camera_estimation_warmstart'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: true
+  - stage: 'after_gvhmr_preprocessing'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr' #这时候incam和gobalcam都是正确的
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_skating'
+      frame_range: [0, 5]
+  - stage: 'after_skating_removal'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_post_skating'
+      frame_range: [0, 5]
+  - stage: 'before_evaluation'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_before_eval'
+      frame_range: [0, 5]
