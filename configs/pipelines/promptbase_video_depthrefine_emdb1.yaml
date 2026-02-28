@@ -54,11 +54,11 @@ components:
     mask_prompt: true
     img_size: 896
     use_mean_shape: true
-    substep_cache_use: true
-    substep_cache_overwrite: false
+    substep_cache_use: false
+    substep_cache_overwrite: true 
     cache:
       enabled: true
-      use_cache: true
+      use_cache: false
       overwrite: true
 
   # 4. 世界坐标系变换
@@ -71,13 +71,6 @@ components:
       use_cache: false
       overwrite: true
 
-  # 5. OAR 深度精修（暂时禁用）
-  # 问题分析（pa_mpjpe 36→54）：
-  #   1. 无外部 2D 关键点时，reprojection target 是自身投影，零信息量
-  #   2. floor_loss/contact_height 假设 y=0 是地面，但 SLAM 世界坐标系地面高度未知
-  #   3. orient_refine 无有效锚定，delta 乱飘
-  #   4. IK 在错误 delta 上进一步放大误差
-  # 修复方向：接入 ViTPose 等独立 2D 检测器提供真实 reprojection target
   - type: depth_scene_refine
     name: oar_refine
     metric3d_model: "metric3d_vit_small"
@@ -89,44 +82,55 @@ components:
     stride: 5
     sigma: 5.0
     # 优化参数
-    opt_steps: 50
+    opt_steps: 2
     opt_lr: 0.01
     # 损失权重
-    loss_reproj_w: 0.5
-    loss_depth_w: 10.0
+    loss_reproj_w: 0
+    loss_depth_w: 1.0
     loss_smooth_vel_w: 0.25
     loss_smooth_acc_w: 0.25
     loss_contact_vel_w: 1000.0
-    loss_contact_height_w: 10.0
-    loss_floor_w: 100.0
+    loss_contact_height_w: 1.0
+    loss_floor_w: 1.0
     loss_reg_w: 0.1
     # 功能开关
-    enable_depth_constraint: true
-    enable_ik: false
-    enable_orient_refine: false
+    enable_depth_constraint: false
+    enable_rollback_check: false
+    enable_ik: false #用于基于static_logic纠正相邻帧的运动滑步
+    enable_orient_refine: false #不修改全局oritation，仅在当前帧下
     opt_contact: false
+    # 图像模型 3D body pose 纠正
+    enable_img_pose_refine: true
+    img_pose_opt_steps: 30 #做30次优化
+    img_pose_opt_lr: 0.005
+    loss_img3d_w: 5.0
+    loss_img3d_sigma: 0.1
+    loss_bodypose_reg_w: 0.1
     # 深度帧采样
     depth_frame_stride: 5
     metric3d_batch_size: 4
     save_depth_maps: false
     fps: 30
     device: "cuda"
+    # OAR 诊断可视化（深度图、2D关键点、重投影误差）
+    vis_oar_diagnostics: true
+    vis_oar_frame_stride: 5
     cache:
       enabled: true
       use_cache: false
       overwrite: true
 
   # 5. Adjacent Frame SMPL Rendering
-  - type: adjacent_smpl_renderer
-    name: adjacent_frame_rendering
-    pre_dis: 5
-    num_adjacent_frames: 2
-    device: "cuda"
-    render_mode: "world"  # GT 模式：直接使用世界坐标系 trans 渲染，避免 Y 轴偏移
-    cache:
-      enabled: true
-      use_cache: false  # 设为 true 时直接读取 adjacent_smpl 目录的图片
-      overwrite: true   # 设为 true 时删除原目录下所有图片再重新渲染
+  # - type: adjacent_smpl_renderer
+  #   name: adjacent_frame_rendering
+  #   pre_dis: 5
+  #   num_adjacent_frames: 2
+  #   device: "cuda"
+  #   render_mode: "prompthmr_camera"  # PromptHMR incam vertices + SLAM c2w 帧间变换
+  #   cache:
+  #     enabled: true
+  #     use_cache: false  # 设为 true 时直接读取 adjacent_smpl 目录的图片
+  #     overwrite: true   # 设为 true 时删除原目录下所有图片再重新渲染
 
   # # 6. 滑步消除
   # - type: skating_removal
@@ -153,7 +157,14 @@ components:
 
 # Hooks: OAR 前后可视化对比
 hooks:
+  - stage: 'after_gvhmr_preprocessing'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_skating'
+      frame_range: [0, 5]
 
+  
   - stage: 'after_world_transform'
     function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
     enabled: true
@@ -168,9 +179,3 @@ hooks:
       output_subdir: 'incam_global_post_oar'
       frame_range: [0, 50]
 
-  - stage: 'after_skating_removal'
-    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
-    enabled: true
-    params:
-      output_subdir: 'incam_global_post_skating'
-      frame_range: [0, 50]

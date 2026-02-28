@@ -4,7 +4,7 @@ AdjacentSMPLRenderer - 渲染相邻帧SMPL mesh的组件
 这个组件复现adjTram的功能，对每一帧渲染当前帧、前x帧、后x帧的SMPL mesh，
 并将它们在当前帧的相机视角下拼接显示。
 
-支持三种渲染模式（render_mode）：
+支持四种渲染模式（render_mode）：
 - 'camera'（默认，适合 TRAM）: 使用相机坐标系的 trans (local_trans) 生成
   vertices，再通过 c2w 做帧间相对变换。适合 VIMO 等估计方法产生的相机坐标系参数。
 - 'world'（适合 GT）: 直接使用世界坐标系的 trans (global_trans) + 世界坐标系
@@ -13,6 +13,10 @@ AdjacentSMPLRenderer - 渲染相邻帧SMPL mesh的组件
 - 'gvhmr_world'（适合 GVHMR）: 从 GVHMR 的 global+incam 两套输出反推每帧
   T_w2c 变换矩阵，用修正后的全局 vertices 投影到当前帧相机视角下。
   完全不需要外部 SLAM 的相机参数。
+- 'prompthmr_camera'（适合 PromptHMR + SLAM）: 使用 PromptHMR 的相机坐标系参数
+  (global_orient_c + body_pose_aa + trans) 通过 SMPL-X 生成 incam vertices，
+  再用 DROID-SLAM 的 c2w 做帧间相对变换投影到中心帧视角。
+  使用 GVHMRRenderer + 完整 K 矩阵渲染。
 """
 
 import os
@@ -42,9 +46,11 @@ class AdjacentSMPLRenderer(Component):
         pre_dis: 相邻帧间隔（默认20）
         device: 计算设备（默认'cpu'）
         output_dir: 输出目录（默认'results/adjacent_smpl'）
-        render_mode: 渲染模式 ('camera' 或 'world')
+        render_mode: 渲染模式 ('camera' 或 'world' 或 'gvhmr_world' 或 'prompthmr_camera')
             - 'camera': TRAM 模式，使用相机坐标系 trans + c2w 帧间变换
             - 'world': GT 模式，使用世界坐标系 trans + w2c 投影
+            - 'gvhmr_world': GVHMR 模式，反推 T_w2c 投影
+            - 'prompthmr_camera': PromptHMR + SLAM 模式，incam vertices + SLAM c2w 帧间变换
     """
 
     COMPONENT_TYPE = "adjacent_smpl_renderer"
@@ -54,7 +60,7 @@ class AdjacentSMPLRenderer(Component):
         'num_adjacent_frames': 1,  # 前后渲染的帧数（渲染 i-x*pre_dis 到 i+x*pre_dis）
         'device': 'cpu',
         'output_dir': 'results/adjacent_smpl',
-        'render_mode': 'camera',  # 'camera' (TRAM), 'world' (GT), 'gvhmr_world' (GVHMR)
+        'render_mode': 'camera',  # 'camera' (TRAM), 'world' (GT), 'gvhmr_world' (GVHMR), 'prompthmr_camera' (PromptHMR + SLAM c2w)
         'frame_selection_mode': 'uniform',  # 'uniform' (均匀 pre_dis 采样) 或 'keyframe' (使用 SLAM 关键帧)
         'render_only_keyframes': False,  # keyframe 模式下是否只渲染关键帧（跳过非关键帧以节省时间）
         'mesh_color_mode': 'colorful',  # 'colorful' (每帧不同彩色) 或 'uniform' (统一灰白色)
@@ -284,6 +290,8 @@ class AdjacentSMPLRenderer(Component):
             return self._execute_keyframe_mode(data)
         elif self.render_mode == 'gvhmr_world':
             return self._execute_gvhmr_world_mode(data)
+        elif self.render_mode == 'prompthmr_camera':
+            return self._execute_prompthmr_camera_mode(data)
         elif self.render_mode == 'world':
             return self._execute_world_mode(data)
         else:
@@ -401,6 +409,189 @@ class AdjacentSMPLRenderer(Component):
 
             output_path = os.path.join(output_dir, img_name)
             cv2.imwrite(output_path, final_img)
+
+        self._log_render_summary(rendered_indices, N, last_frame_saved, output_dir)
+        self._save_render_info(data, N, rendered_indices, last_frame_saved, output_dir)
+
+        return data
+
+    def _execute_prompthmr_camera_mode(self, data: PipelineData) -> PipelineData:
+        """PromptHMR 相机坐标系模式渲染（PromptHMR + DROID-SLAM c2w）
+
+        策略：使用 PromptHMR 的相机坐标系参数 (global_orient_c + body_pose_aa + trans)
+        通过 SMPL-X 模型生成每帧在各自相机坐标系下的 vertices，然后用 DROID-SLAM
+        估计的 c2w 做帧间相对变换 (cam_j -> world -> cam_i)，将相邻帧的 SMPL mesh
+        投影到中心帧的视角下渲染。
+
+        与 camera 模式的区别：
+        - 使用 SMPL-X (supermotion) + smplx2smpl 而非标准 SMPL（与 PromptHMR 一致）
+        - 使用 axis-angle 参数 (global_orient_c, body_pose_aa) 而非 rotmat
+        - 使用 GVHMRRenderer + 完整 K 矩阵（保留真实 cx/cy）
+
+        与 gvhmr_world 模式的区别：
+        - 使用 DROID-SLAM 的 c2w 而非从 incam/global 参数反推 T_w2c
+        - vertices 在相机坐标系下生成，通过 c2w 做帧间变换
+        """
+        import sys
+
+        gvhmr_abs = os.path.abspath(self.gvhmr_root)
+        if gvhmr_abs not in sys.path:
+            sys.path.insert(0, gvhmr_abs)
+        from hmr4d.utils.smplx_utils import make_smplx
+        from hmr4d.utils.vis.renderer import Renderer as GVHMRRenderer
+
+        # 获取图像路径
+        if hasattr(data, 'image_paths'):
+            img_paths = data.image_paths
+        else:
+            img_paths = data.metadata.get('image_paths', [])
+
+        N = len(img_paths)
+        first_img = cv2.imread(img_paths[0])
+        H, W = first_img.shape[:2]
+
+        # 获取完整 K 矩阵 — 优先使用 HPE estimate_K
+        K_fullimg = None
+        hpe_K = data.metadata.get('hpe_K', None) if data.metadata else None
+        if hpe_K is not None:
+            if isinstance(hpe_K, np.ndarray):
+                K_fullimg = torch.from_numpy(hpe_K).float()
+            elif isinstance(hpe_K, torch.Tensor):
+                K_fullimg = hpe_K.float()
+            self.logger.info(
+                f"[prompthmr_camera] Using HPE estimate_K: fx={float(K_fullimg[0,0]):.2f}, "
+                f"fy={float(K_fullimg[1,1]):.2f}, "
+                f"cx={float(K_fullimg[0,2]):.2f}, cy={float(K_fullimg[1,2]):.2f}"
+            )
+        if K_fullimg is None and data.camera_params and data.camera_params.intrinsics is not None:
+            K_cur = data.camera_params.intrinsics
+            if isinstance(K_cur, np.ndarray):
+                K_fullimg = torch.from_numpy(K_cur).float()
+            else:
+                K_fullimg = K_cur.float()
+            self.logger.warning(
+                f"[prompthmr_camera] No hpe_K found, falling back to GT K: "
+                f"fx={float(K_fullimg[0,0]):.2f} — may cause projection mismatch!"
+            )
+        if K_fullimg is None:
+            intrinsics = self._get_intrinsics(data)
+            if intrinsics is not None:
+                if isinstance(intrinsics, np.ndarray):
+                    K_fullimg = torch.from_numpy(intrinsics).float()
+                else:
+                    K_fullimg = intrinsics.float()
+        if K_fullimg is None:
+            self.logger.error("No camera intrinsics found for prompthmr_camera mode")
+            return data
+
+        # 获取 DROID-SLAM 的 c2w
+        R_c2w, t_c2w = self._get_c2w(data)
+        if R_c2w is None:
+            self.logger.error("prompthmr_camera mode requires SLAM c2w (data.camera_params.R/T)")
+            return data
+
+        # 获取 PromptHMR 的 incam 参数
+        sp = data.smpl_params
+        if sp.global_orient_c is None or sp.body_pose_aa is None or sp.trans is None:
+            self.logger.error(
+                "prompthmr_camera mode requires global_orient_c, body_pose_aa, trans in smpl_params"
+            )
+            return data
+
+        device = torch.device(self.device)
+
+        def _to_tensor(x):
+            if isinstance(x, np.ndarray):
+                return torch.from_numpy(x).float().to(device)
+            return x.float().to(device)
+
+        global_orient_c = _to_tensor(sp.global_orient_c)  # (F, 3)
+        body_pose_aa = _to_tensor(sp.body_pose_aa)         # (F, 63)
+        betas = _to_tensor(sp.betas)                       # (F, 10)
+        trans_c = _to_tensor(sp.trans)                      # (F, 3)
+
+        self.logger.info(
+            f"[prompthmr_camera] SMPL params: global_orient_c={global_orient_c.shape}, "
+            f"body_pose={body_pose_aa.shape}, betas={betas.shape}, trans={trans_c.shape}"
+        )
+
+        # --- 1. 用 SMPL-X 生成相机坐标系下的 vertices ---
+        self.logger.info("[prompthmr_camera] Loading SMPL-X model (supermotion)...")
+        smplx_model = make_smplx("supermotion").to(device)
+        smplx2smpl = torch.load(
+            os.path.join(gvhmr_abs, "hmr4d/utils/body_model/smplx2smpl_sparse.pt")
+        ).to(device)
+        faces_smpl = make_smplx("smpl").faces
+
+        with torch.no_grad():
+            smplx_out = smplx_model(
+                global_orient=global_orient_c,
+                body_pose=body_pose_aa,
+                betas=betas,
+                transl=trans_c,
+            )
+            vertices_incam = torch.stack(
+                [torch.matmul(smplx2smpl, v) for v in smplx_out.vertices]
+            )  # (F, V_smpl, 3)
+
+        self.logger.info(f"Generated incam vertices via SMPL-X: {vertices_incam.shape}")
+
+        # --- 2. 渲染：用 SLAM c2w 做帧间相对变换 ---
+        render = GVHMRRenderer(W, H, device=device, faces=faces_smpl, K=K_fullimg)
+        self.frame_colors = self._generate_frame_colors(N)
+        output_dir = self._get_output_dir(data)
+        rendered_indices = list(range(0, N, self.pre_dis))
+        last_frame_saved = self._save_last_frame_if_needed(
+            img_paths, rendered_indices, N, output_dir
+        )
+
+        self.logger.info(f"Rendering {len(rendered_indices)} frames (every {self.pre_dis}th frame)...")
+
+        for i in tqdm(rendered_indices, desc="Rendering adjacent frames (prompthmr_camera)"):
+            img = cv2.imread(img_paths[i])
+            final_img = img.copy()
+            img_name = os.path.basename(img_paths[i])
+
+            # 当前帧 cam_i 的 c2w / w2c
+            R_c2w_i = torch.from_numpy(R_c2w[i]).float().to(device)
+            t_c2w_i = torch.from_numpy(t_c2w[i]).float().to(device)
+            R_w2c_i = R_c2w_i.T
+            t_w2c_i = -R_w2c_i @ t_c2w_i
+
+            for offset in range(-self.num_adjacent_frames * self.pre_dis,
+                                self.num_adjacent_frames * self.pre_dis + 1,
+                                self.pre_dis):
+                frame_idx = i + offset
+                if 0 <= frame_idx < N:
+                    verts_cam_j = vertices_incam[frame_idx].to(device)
+
+                    if offset == 0:
+                        verts_in_cam_i = verts_cam_j
+                    else:
+                        # cam_j -> world -> cam_i
+                        R_c2w_j = torch.from_numpy(R_c2w[frame_idx]).float().to(device)
+                        t_c2w_j = torch.from_numpy(t_c2w[frame_idx]).float().to(device)
+
+                        verts_world = torch.einsum('ij,vj->vi', R_c2w_j, verts_cam_j) + t_c2w_j
+                        verts_in_cam_i = torch.einsum('ij,vj->vi', R_w2c_i, verts_world) + t_w2c_i
+
+                    if self.mesh_render_style == 'contour':
+                        final_img = self._render_contour(
+                            render, verts_in_cam_i, final_img,
+                            colors=self._get_mesh_color(frame_idx),
+                            thickness=self.contour_thickness
+                        )
+                    else:
+                        final_img = render.render_mesh(
+                            verts_in_cam_i, final_img, colors=self._get_mesh_color(frame_idx)
+                        )
+
+            output_path = os.path.join(output_dir, img_name)
+            cv2.imwrite(output_path, final_img)
+
+        del smplx_model, smplx2smpl, vertices_incam
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self._log_render_summary(rendered_indices, N, last_frame_saved, output_dir)
         self._save_render_info(data, N, rendered_indices, last_frame_saved, output_dir)
@@ -576,12 +767,27 @@ class AdjacentSMPLRenderer(Component):
         first_img = cv2.imread(img_paths[0])
         H, W = first_img.shape[:2]
 
-        # 获取相机内参（完整 K 矩阵）
+        # 获取相机内参（完整 K 矩阵）— 优先使用 HPE estimate_K
         K_fullimg = None
-        if data.camera_params and data.camera_params.intrinsics is not None:
+        hpe_K = data.metadata.get('hpe_K', None) if data.metadata else None
+        if hpe_K is not None:
+            if isinstance(hpe_K, np.ndarray):
+                K_fullimg = torch.from_numpy(hpe_K).float()
+            elif isinstance(hpe_K, torch.Tensor):
+                K_fullimg = hpe_K.float()
+            self.logger.info(
+                f"[gvhmr_world] Using HPE estimate_K: fx={float(K_fullimg[0,0]):.2f}, "
+                f"fy={float(K_fullimg[1,1]):.2f}, "
+                f"cx={float(K_fullimg[0,2]):.2f}, cy={float(K_fullimg[1,2]):.2f}"
+            )
+        if K_fullimg is None and data.camera_params and data.camera_params.intrinsics is not None:
             K_fullimg = data.camera_params.intrinsics
             if isinstance(K_fullimg, np.ndarray):
                 K_fullimg = torch.from_numpy(K_fullimg).float()
+            self.logger.warning(
+                f"[gvhmr_world] No hpe_K found, falling back to GT K: "
+                f"fx={float(K_fullimg[0,0]):.2f} — may cause projection mismatch!"
+            )
         if K_fullimg is None:
             # fallback: 从 annotations 获取
             intrinsics = self._get_intrinsics(data)
@@ -928,13 +1134,28 @@ class AdjacentSMPLRenderer(Component):
         return vertices, R_c2w, t_c2w
 
     def _get_intrinsics(self, data):
-        """获取相机内参"""
+        """获取相机内参
+
+        优先使用 HPE 推理时的 estimate_K (hpe_K)，因为 SMPL 参数
+        (global_orient_w, global_trans 等) 是基于 estimate_K 推理的，
+        渲染时必须用相同的 K 才能正确对齐到图像。
+        仅在 hpe_K 不可用时 fallback 到 GT K。
+        """
+        # 优先级1: HPE estimate_K（与 SMPL 参数推理一致）
+        hpe_K = data.metadata.get('hpe_K', None) if data.metadata else None
+        if hpe_K is not None:
+            self.logger.info("[_get_intrinsics] Using HPE estimate_K (hpe_K) for projection consistency")
+            if isinstance(hpe_K, np.ndarray):
+                return hpe_K
+            return hpe_K.numpy() if hasattr(hpe_K, 'numpy') else hpe_K
+        # 优先级2: camera_params.intrinsics (GT K / SLAM K)
         if data.camera_params is not None and data.camera_params.intrinsics is not None:
             return data.camera_params.intrinsics
+        # 优先级3: annotations GT K
         elif data.annotations and 'camera' in data.annotations and 'intrinsics' in data.annotations['camera']:
             return data.annotations['camera']['intrinsics']
         else:
-            self.logger.error("No camera intrinsics found in camera_params or annotations")
+            self.logger.error("No camera intrinsics found in hpe_K, camera_params or annotations")
             return None
 
     def _get_c2w(self, data):

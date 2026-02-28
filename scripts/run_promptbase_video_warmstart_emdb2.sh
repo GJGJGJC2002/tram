@@ -11,8 +11,8 @@ conda activate alignHMR
 
 # 设置参数
 CONFIG="configs/pipelines/promptbase_video_warmstart_emdb2.yaml"
-SEQ="48_outdoor_walk_downhill"
-PERSON="P6"
+SEQ="55_outdoor_walk"
+PERSON="P7"
 SPLIT=2
 DATASET_PATH="datasets/EMDB"
 GPU_ID=1

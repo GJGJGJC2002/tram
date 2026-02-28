@@ -58,6 +58,7 @@ components:
     pre_dis: 3
     num_adjacent_frames: 2
     device: "cuda"
+    render_mode: "camera" # 使用相机坐标系渲染, 用的是选择四元角，"world"用的GT
 
   # 6. Camera Motion Estimation (SLAM on rendered images with interpolation)
   - type: slam

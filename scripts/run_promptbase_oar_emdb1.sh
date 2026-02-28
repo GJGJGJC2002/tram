@@ -14,7 +14,7 @@ SEQ="44_indoor_rom"
 PERSON="P5"
 SPLIT=1
 DATASET_PATH="datasets/EMDB"
-GPU_ID=0
+GPU_ID=1
 
 # 设置 GPU
 export CUDA_VISIBLE_DEVICES=$GPU_ID

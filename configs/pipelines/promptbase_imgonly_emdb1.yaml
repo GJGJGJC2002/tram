@@ -35,8 +35,8 @@ components:
     substep_cache_overwrite: false
     cache:
       enabled: true
-      use_cache: false
-      overwrite: true
+      use_cache: true
+      overwrite: false
 
   # 3. Evaluation (EMDB1: incam metrics only)
   - type: evaluation
@@ -53,7 +53,7 @@ components:
 hooks:
   - stage: 'after_prompthmr_imgonly_inference'
     function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
-    enabled: false
+    enabled: true
     params:
       output_subdir: 'incam_imgonly'
       frame_range: [0, 5]

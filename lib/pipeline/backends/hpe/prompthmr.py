@@ -155,8 +155,9 @@ class PromptHMRBackend(Backend):
 
     # === 子步骤缓存 ===
 
-    def _compute_cache_key(self, image_paths: List[str], bboxes: np.ndarray) -> str:
-        """根据图像路径列表和 bbox 计算缓存 key（MD5 hash）"""
+    def _compute_cache_key(self, image_paths: List[str], bboxes: np.ndarray,
+                           K_override: np.ndarray = None) -> str:
+        """根据图像路径列表、bbox 和可选的 K 矩阵计算缓存 key（MD5 hash）"""
         h = hashlib.md5()
         # 用图像文件名（不含目录）+ 帧数 作为主要标识
         h.update(str(len(image_paths)).encode())
@@ -164,6 +165,12 @@ class PromptHMRBackend(Backend):
             h.update(os.path.basename(p).encode())
         # bbox 内容也参与 hash，防止同一视频不同检测框混淆
         h.update(bboxes.tobytes())
+        # K 矩阵参与 hash，防止 estimate_K 和 GT K 的缓存混淆
+        if K_override is not None:
+            if isinstance(K_override, torch.Tensor):
+                h.update(K_override.cpu().numpy().tobytes())
+            else:
+                h.update(K_override.tobytes())
         return h.hexdigest()[:16]
 
     def _get_substep_cache_path(self, cache_key: str, substep_name: str) -> Optional[str]:
@@ -200,7 +207,8 @@ class PromptHMRBackend(Backend):
         except Exception as e:
             self.logger.warning(f"Failed to save {substep_name} cache: {e}")
 
-    def _run_image_model(self, image_paths, bboxes_xyxy, vitpose_kp2d, K_fullimg):
+    def _run_image_model(self, image_paths, bboxes_xyxy, vitpose_kp2d, K_fullimg,
+                         return_smpl=False):
         """
         运行 PromptHMR 图像模型，提取每帧的 2 通道特征 (smpl_token, loc_token)
 
@@ -209,9 +217,14 @@ class PromptHMRBackend(Backend):
             bboxes_xyxy: (N, 4) xyxy 格式边界框
             vitpose_kp2d: (N, 17/25, 3) VitPose 关键点
             K_fullimg: (N, 3, 3) 相机内参
+            return_smpl: 如果 True，同时返回图像模型的单帧 SMPL 结果
+                         (rotmat, betas, transl, smpl_vertices, smpl_j3d)
 
         Returns:
             features: (N, 2, 1024) PromptHMR 图像特征
+            如果 return_smpl=True，额外返回 dict:
+                'rotmat': (N, 22, 3, 3), 'betas': (N, 10), 'transl': (N, 3),
+                'smpl_vertices': (N, 6890, 3), 'smpl_j3d': (N, 24, 3)
         """
         import cv2
         from PIL import Image, ImageOps
@@ -226,8 +239,13 @@ class PromptHMRBackend(Backend):
         IMG_SIZE = self.img_size
         N = len(image_paths)
         all_features = []
+        # 用于保存图像模型的单帧 SMPL 输出（当 return_smpl=True 时）
+        all_img_rotmat = [] if return_smpl else None
+        all_img_betas = [] if return_smpl else None
+        all_img_transl = [] if return_smpl else None
+        all_img_smpl_verts = [] if return_smpl else None
 
-        self.logger.info(f"Running PromptHMR image model on {N} frames...")
+        self.logger.info(f"Running PromptHMR image model on {N} frames (return_smpl={return_smpl})...")
 
         from torch.utils.data import Dataset, DataLoader
 
@@ -254,14 +272,20 @@ class PromptHMRBackend(Backend):
                 boxes = torch.cat([boxes, torch.ones(1, 1)], dim=-1)  # (1, 5)
 
                 # 关键点 (取前 25 个 joints，如果有)
+                # 注意：必须用 .copy() 断开与原始数组的内存共享，
+                # 否则后续 inplace 缩放操作会污染原始 vitpose_kp2d
                 kpt = ds_self.vitpose_kp2d[idx]  # (J, 3)
                 if isinstance(kpt, np.ndarray):
-                    kpt = torch.from_numpy(kpt).float()
+                    kpt = torch.from_numpy(kpt.copy()).float()
+                else:
+                    kpt = kpt.clone().float()
                 kpt = kpt.unsqueeze(0)  # (1, J, 3)
 
                 cam_int = ds_self.K_fullimg[idx]  # (3, 3)
                 if isinstance(cam_int, np.ndarray):
-                    cam_int = torch.from_numpy(cam_int).float()
+                    cam_int = torch.from_numpy(cam_int.copy()).float()
+                else:
+                    cam_int = cam_int.clone().float()
                 cam_int = cam_int.unsqueeze(0)  # (1, 3, 3)
 
                 # pad image to IMG_SIZE
@@ -317,8 +341,31 @@ class PromptHMRBackend(Backend):
                 feat = output[bid]['features'][0]  # (2, 1024)
                 all_features.append(feat.cpu())
 
+                if return_smpl:
+                    all_img_rotmat.append(output[bid]['rotmat'][0].cpu())            # (22, 3, 3)
+                    all_img_betas.append(output[bid]['betas'][0].cpu())              # (10,)
+                    all_img_transl.append(output[bid]['transl'][0].cpu())            # (3,)
+                    all_img_smpl_verts.append(output[bid]['smpl_vertices'][0].cpu()) # (6890, 3)
+
         features = torch.stack(all_features)  # (N, 2, 1024)
         self.logger.info(f"PromptHMR image features extracted: {features.shape}")
+
+        if return_smpl:
+            j_regressor = self.phmr_model.smpl.J_regressor[:24].cpu()  # (24, 6890)
+            smpl_verts = torch.stack(all_img_smpl_verts)               # (N, 6890, 3)
+            img_smpl = {
+                'rotmat': torch.stack(all_img_rotmat),       # (N, 22, 3, 3)
+                'betas': torch.stack(all_img_betas),         # (N, 10)
+                'transl': torch.stack(all_img_transl),       # (N, 3)
+                'smpl_vertices': smpl_verts,                 # (N, 6890, 3)
+                'smpl_j3d': torch.matmul(j_regressor, smpl_verts),  # (N, 24, 3)
+            }
+            self.logger.info(
+                f"PromptHMR image-model SMPL saved: "
+                f"j3d={img_smpl['smpl_j3d'].shape}, rotmat={img_smpl['rotmat'].shape}"
+            )
+            return features, img_smpl
+
         return features
 
     def estimate_smpl(
@@ -383,8 +430,11 @@ class PromptHMRBackend(Backend):
             else:
                 bboxes_xyxy = bboxes
 
-            # 计算缓存 key（基于图像路径 + bbox 内容）
+            # 计算缓存 key
+            # VitPose 缓存不依赖 K，用基础 key（图像路径 + bbox）
             cache_key = self._compute_cache_key(image_paths, bboxes_xyxy)
+            # 图像模型缓存依赖 K（不同的 K 产生不同的特征），需要额外加入 K_fullimg_override
+            cache_key_img = self._compute_cache_key(image_paths, bboxes_xyxy, K_fullimg_override)
 
             # 切换到 GVHMR 目录（VitPose 等工具需要）
             os.chdir(gvhmr_abs)
@@ -443,24 +493,42 @@ class PromptHMRBackend(Backend):
                 self._save_substep_cache(cache_key, 'vitpose', vitpose)
 
             # --- 4. 构建相机内参 ---
-            self.logger.info("Estimating camera intrinsics...")
+            # 视频头（GVHMR video head）始终用 estimate_K（训练时就用的这个）
+            K_fullimg_vid = estimate_K(width, height).repeat(N, 1, 1)
+            self.logger.info(
+                f"Video head K (estimate_K): fx={float(K_fullimg_vid[0, 0, 0]):.2f}, "
+                f"cx={float(K_fullimg_vid[0, 0, 2]):.2f}, cy={float(K_fullimg_vid[0, 1, 2]):.2f}"
+            )
+
+            # 图像模型的 K：优先用传入的 GT K（CameraEncoder + decode_transl 需要准确的 K），
+            # 若未提供则退回到 estimate_K
             if K_fullimg_override is not None:
                 K_np = K_fullimg_override
                 if isinstance(K_np, np.ndarray):
                     K_np = torch.from_numpy(K_np).float()
-                K_fullimg = K_np.unsqueeze(0).repeat(N, 1, 1) if K_np.ndim == 2 else K_np[:1].repeat(N, 1, 1)
+                K_fullimg_img = K_np.unsqueeze(0).repeat(N, 1, 1) if K_np.ndim == 2 else K_np[:1].repeat(N, 1, 1)
+                self.logger.info(
+                    f"Image model K (GT override): fx={float(K_fullimg_img[0, 0, 0]):.2f}, "
+                    f"cx={float(K_fullimg_img[0, 0, 2]):.2f}, cy={float(K_fullimg_img[0, 1, 2]):.2f}"
+                )
             elif img_focal is not None:
                 from hmr4d.utils.geo.hmr_cam import convert_f_to_K
-                K_fullimg = convert_f_to_K(img_focal, width, height).repeat(N, 1, 1)
+                K_fullimg_img = convert_f_to_K(img_focal, width, height).repeat(N, 1, 1)
+                self.logger.info(f"Image model K (from img_focal={img_focal})")
             elif self.f_mm is not None:
-                K_fullimg = create_camera_sensor(width, height, self.f_mm)[2].repeat(N, 1, 1)
+                K_fullimg_img = create_camera_sensor(width, height, self.f_mm)[2].repeat(N, 1, 1)
+                self.logger.info(f"Image model K (from f_mm={self.f_mm})")
             else:
-                K_fullimg = estimate_K(width, height).repeat(N, 1, 1)
+                K_fullimg_img = K_fullimg_vid.clone()
+                self.logger.info("Image model K (estimate_K, same as video head)")
 
-            # --- 5. 运行 PromptHMR 图像模型提取特征（带缓存） ---
-            phmr_features = self._load_substep_cache(cache_key, 'phmr_features')
+            # --- 5. 运行 PromptHMR 图像模型提取特征 + 单帧 SMPL（带缓存） ---
+            phmr_features = self._load_substep_cache(cache_key_img, 'phmr_features')
+            phmr_img_smpl = self._load_substep_cache(cache_key_img, 'phmr_img_smpl')
             if phmr_features is not None:
                 self.logger.info("PromptHMR image features loaded from cache, skipping inference")
+                if phmr_img_smpl is not None:
+                    self.logger.info("PromptHMR image-model SMPL loaded from cache")
             else:
                 # 先将视频头卸载到 CPU 以腾出显存给图像模型（DINOv2 backbone 很大）
                 self.vid_head.cpu()
@@ -470,13 +538,16 @@ class PromptHMRBackend(Backend):
                 self.phmr_model.cuda()
 
                 os.chdir(prompthmr_abs)
-                phmr_features = self._run_image_model(
-                    image_paths, bboxes_xyxy, vitpose.numpy(), K_fullimg.numpy()
-                )  # (N, 2, 1024)
+                result = self._run_image_model(
+                    image_paths, bboxes_xyxy, vitpose.numpy(), K_fullimg_img.numpy(),
+                    return_smpl=True,
+                )
+                phmr_features, phmr_img_smpl = result  # (N, 2, 1024), dict
                 torch.cuda.empty_cache()
 
                 # 保存 Image Model 缓存
-                self._save_substep_cache(cache_key, 'phmr_features', phmr_features)
+                self._save_substep_cache(cache_key_img, 'phmr_features', phmr_features)
+                self._save_substep_cache(cache_key_img, 'phmr_img_smpl', phmr_img_smpl)
 
                 # 图像特征提取完毕，将图像模型卸载到 CPU
                 self.phmr_model.cpu()
@@ -571,12 +642,11 @@ class PromptHMRBackend(Backend):
 
             cam_angvel = compute_cam_angvel(R_w2c)
             vitpose_norm = normalize_kp2d(vitpose, bbx_xys_smooth).float()
-
             batch = {
                 "length": torch.tensor([N]),
                 "obs": vitpose_norm[None],
                 "bbx_xys": bbx_xys_smooth[None],
-                "K_fullimg": K_fullimg[None],
+                "K_fullimg": K_fullimg_vid[None],  # 视频头用 estimate_K
                 "cam_angvel": cam_angvel[None],
                 "f_imgseq": phmr_features[None],  # (1, N, 2, 1024)
             }
@@ -591,7 +661,6 @@ class PromptHMRBackend(Backend):
                 output_w_kpts = self.vid_head.pipeline.forward(
                     batch, train=False, postproc=False, static_cam=self.static_cam
                 )
-
             # 第二次：不带关键点（用于 pose/shape）
             batch_no_kpts = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             batch_no_kpts['obs'] = torch.zeros_like(batch['obs'])
@@ -638,9 +707,10 @@ class PromptHMRBackend(Backend):
                 'smpl_params_global': pred['smpl_params_global'],
                 'smpl_params_incam': pred['smpl_params_incam'],
                 'static_conf_logits': static_conf_logits,
-                'K_fullimg': K_fullimg,
+                'K_fullimg': K_fullimg_vid,  # 返回 estimate_K（视频头用的 K）
                 'skeleton_offset': skeleton_offset,
                 'vitpose_kp2d': vitpose,  # (N, 17, 3) COCO-17 keypoints from ViTPose
+                'phmr_img_smpl': phmr_img_smpl,  # 图像模型单帧 SMPL 结果 (or None)
             }
         finally:
             os.chdir(original_cwd)

@@ -329,18 +329,22 @@ class HPEComponent(BackendComponent):
         # 获取相机参数
         img_focal, img_center = self._get_camera_params(data)
 
-        # 尝试从 GT annotations 中获取完整的 K 矩阵，直接传给 GVHMR
-        # 这与 GVHMR 官方评估 EMDB 时的做法一致（直接用 GT K 作为 K_fullimg）
-        gt_K_matrix = None
-        if data.annotations is not None and 'camera' in data.annotations:
-            gt_intrinsics = data.annotations['camera'].get('intrinsics')
-            if gt_intrinsics is not None:
-                gt_K_matrix = gt_intrinsics  # 完整的 3x3 K 矩阵
-                self.logger.info(
-                    f"Using GT K matrix for GVHMR: "
-                    f"fx={float(gt_intrinsics[0, 0]):.2f}, fy={float(gt_intrinsics[1, 1]):.2f}, "
-                    f"cx={float(gt_intrinsics[0, 2]):.2f}, cy={float(gt_intrinsics[1, 2]):.2f}"
-                )
+        # PromptHMR 后端需要区分两套 K：
+        #   - 图像模型 (CameraEncoder + decode_transl) 训练时使用 GT K，需传入 GT K
+        #   - 视频头 (GVHMR video head) 训练时使用 estimate_K，继续用 estimate_K
+        # GVHMR 后端全程用 estimate_K（官方评估 EMDB 也这样做）。
+        gt_K_for_imgmodel = None
+        if self.backend_type == 'prompthmr':
+            # PromptHMR 图像模型需要 GT K
+            if data.annotations is not None and 'camera' in data.annotations:
+                gt_intrinsics = data.annotations['camera'].get('intrinsics')
+                if gt_intrinsics is not None:
+                    gt_K_for_imgmodel = gt_intrinsics  # 完整的 3x3 K 矩阵
+                    self.logger.info(
+                        f"Using GT K for PromptHMR image model: "
+                        f"fx={float(gt_intrinsics[0, 0]):.2f}, fy={float(gt_intrinsics[1, 1]):.2f}, "
+                        f"cx={float(gt_intrinsics[0, 2]):.2f}, cy={float(gt_intrinsics[1, 2]):.2f}"
+                    )
 
         self.logger.info("Running GVHMR inference...")
 
@@ -351,13 +355,16 @@ class HPEComponent(BackendComponent):
             substep_dir = os.path.join(output_dir, 'intermediate', seq_name)
             self.backend.substep_cache_dir = substep_dir
 
-        # 调用 GVHMR 后端
+        # 调用后端：
+        #   - GVHMR 后端：K_fullimg_override=None，走 estimate_K 路径
+        #   - PromptHMR 后端：K_fullimg_override=GT K（仅用于图像模型），
+        #     视频头内部仍用 estimate_K
         gvhmr_results = self.backend.estimate_smpl(
             image_paths=data.image_paths,
             bboxes=data.bboxes,
-            img_focal=img_focal if gt_K_matrix is None else None,
+            img_focal=None,
             img_center=img_center,
-            K_fullimg_override=gt_K_matrix,
+            K_fullimg_override=gt_K_for_imgmodel,
         )
 
         # 解包 GVHMR 输出
@@ -421,10 +428,28 @@ class HPEComponent(BackendComponent):
                 focal_length=float(K_fullimg[0, 0, 0]),
             )
 
+        # 保存 HPE 使用的 K（estimate_K）到 metadata，供 OAR 等后续组件使用
+        # 注意：cam.intrinsics 可能是 GT K（从 SLAM 组件设置），而 HPE 用的是 estimate_K，
+        # 后续投影应使用与推理一致的 K。
+        hpe_K = K_fullimg[0].numpy() if isinstance(K_fullimg, torch.Tensor) else K_fullimg[0]
+        data.metadata['hpe_K'] = hpe_K
+        self.logger.info(
+            f"Saved HPE estimate_K to metadata: fx={float(hpe_K[0,0]):.2f}, "
+            f"cx={float(hpe_K[0,2]):.2f}, cy={float(hpe_K[1,2]):.2f}"
+        )
+
         # 保存 ViTPose 2D 关键点到 metadata（供 OAR 等后续组件使用）
         if 'vitpose_kp2d' in gvhmr_results and gvhmr_results['vitpose_kp2d'] is not None:
             data.metadata['vitpose_kp2d'] = gvhmr_results['vitpose_kp2d']  # (N, 17, 3)
             self.logger.info(f"Saved ViTPose 2D keypoints: {gvhmr_results['vitpose_kp2d'].shape}")
+
+        # 保存 PromptHMR 图像模型单帧 SMPL 结果到 metadata（供 OAR 3D loss 使用）
+        if 'phmr_img_smpl' in gvhmr_results and gvhmr_results['phmr_img_smpl'] is not None:
+            data.metadata['phmr_img_smpl'] = gvhmr_results['phmr_img_smpl']
+            self.logger.info(
+                f"Saved PromptHMR image-model SMPL: "
+                f"j3d={gvhmr_results['phmr_img_smpl']['smpl_j3d'].shape}"
+            )
 
         # 记录元数据
         data.metadata['hpe_stats'] = {
@@ -444,16 +469,9 @@ class HPEComponent(BackendComponent):
         # 获取相机参数
         img_focal, img_center = self._get_camera_params(data)
 
-        # GT K 矩阵
+        # 注意：PromptHMR 模型用 estimate_K（cx=w/2, cy=h/2）训练，
+        # 不应传入 GT K 矩阵，否则 cx/cy 偏差会导致 tx/ty 偏移。
         gt_K_matrix = None
-        if data.annotations is not None and 'camera' in data.annotations:
-            gt_intrinsics = data.annotations['camera'].get('intrinsics')
-            if gt_intrinsics is not None:
-                gt_K_matrix = gt_intrinsics
-                self.logger.info(
-                    f"Using GT K matrix: "
-                    f"fx={float(gt_intrinsics[0, 0]):.2f}, fy={float(gt_intrinsics[1, 1]):.2f}"
-                )
 
         # 为后端设置子步骤缓存目录
         if hasattr(self.backend, 'substep_cache_dir'):
@@ -467,9 +485,9 @@ class HPEComponent(BackendComponent):
         results = self.backend.estimate_smpl(
             image_paths=data.image_paths,
             bboxes=data.bboxes,
-            img_focal=img_focal if gt_K_matrix is None else None,
+            img_focal=None,
             img_center=img_center,
-            K_fullimg_override=gt_K_matrix,
+            K_fullimg_override=None,
         )
 
         # 解包结果
@@ -512,6 +530,10 @@ class HPEComponent(BackendComponent):
                 intrinsics=K_fullimg[0].numpy() if isinstance(K_fullimg, torch.Tensor) else K_fullimg[0],
                 focal_length=float(K_fullimg[0, 0, 0]),
             )
+
+        # 保存 HPE 使用的 K（estimate_K）到 metadata
+        hpe_K = K_fullimg[0].numpy() if isinstance(K_fullimg, torch.Tensor) else K_fullimg[0]
+        data.metadata['hpe_K'] = hpe_K
 
         data.metadata['hpe_stats'] = {
             'num_frames': num_frames,

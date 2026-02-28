@@ -343,12 +343,20 @@ def visualize_smpl_mesh(data: PipelineData, interval: int = None):
     img_sample = cv2.imread(data.image_paths[0])
     img_height, img_width = img_sample.shape[:2]
 
-    # 获取相机参数
+    # 获取相机参数 - 优先使用 hpe_K（与 SMPL trans 一致）
     img_focal = 1000.0  # 默认值
     img_center = None
 
-    # 尝试从 camera_params 获取
-    if data.camera_params and data.camera_params.focal_length:
+    hpe_K = data.metadata.get('hpe_K')
+    if hpe_K is not None:
+        if isinstance(hpe_K, torch.Tensor):
+            hpe_K_np = hpe_K.cpu().numpy()
+        else:
+            hpe_K_np = np.array(hpe_K, dtype=np.float32)
+        img_focal = float((hpe_K_np[0, 0] + hpe_K_np[1, 1]) / 2.0)
+        img_center = hpe_K_np[:2, 2]
+        logger.info(f"[smpl_mesh_vis] Using hpe_K: focal={img_focal:.2f}")
+    elif data.camera_params and data.camera_params.focal_length:
         img_focal = data.camera_params.focal_length
         if data.camera_params.principal_point is not None:
             img_center = data.camera_params.principal_point
@@ -744,11 +752,25 @@ def visualize_incam_global(data: PipelineData):
     faces_smpl = smpl_model.faces
     
     # --- 获取相机内参 ---
+    # SMPL trans 是在 HPE 推理时基于 estimate_K 生成的，渲染必须使用同样的 K
     intrinsics = None
-    if data.camera_params and data.camera_params.intrinsics is not None:
+    hpe_K = data.metadata.get('hpe_K')
+    if hpe_K is not None:
+        if isinstance(hpe_K, torch.Tensor):
+            intrinsics = hpe_K.cpu().numpy()
+        else:
+            intrinsics = np.array(hpe_K, dtype=np.float32)
+        logger.info(f"[incam_global] Using hpe_K: fx={intrinsics[0,0]:.2f}, fy={intrinsics[1,1]:.2f}")
+    elif data.camera_params and data.camera_params.intrinsics is not None:
         intrinsics = data.camera_params.intrinsics
+        if isinstance(intrinsics, torch.Tensor):
+            intrinsics = intrinsics.cpu().numpy()
+        logger.warning(f"[incam_global] hpe_K not found, falling back to camera_params K (may mismatch!)")
     elif data.annotations and 'camera' in data.annotations and 'intrinsics' in data.annotations['camera']:
         intrinsics = data.annotations['camera']['intrinsics']
+        if isinstance(intrinsics, torch.Tensor):
+            intrinsics = intrinsics.cpu().numpy()
+        logger.warning(f"[incam_global] Using GT K from annotations (may mismatch!)")
     
     if intrinsics is None:
         logger.warning("[incam_global] No camera intrinsics found")
@@ -1063,6 +1085,7 @@ def visualize_incam_global_gvhmr(data: PipelineData, output_subdir: str = 'incam
         'betas': betas,
         'transl': trans_c,
     }
+    print(trans_c)
     with torch.no_grad():
         smplx_out_c = smplx_model(**smpl_params_incam)
         verts_incam = torch.stack([torch.matmul(smplx2smpl, v) for v in smplx_out_c.vertices])  # (F, V_smpl, 3)
@@ -1114,33 +1137,39 @@ def visualize_incam_global_gvhmr(data: PipelineData, output_subdir: str = 'incam
     scale, cx, cz = get_ground_params_from_points(joints_glob[:, 0].cpu(), verts_glob.cpu())
     global_renderer.set_ground(scale * 1.5, cx, cz)
 
-    # --- 5. incam renderer（直接使用 camera_params 中的 K） ---
-    # 统一用一个 K：GVHMR 推理时已使用完整 GT K（与 GVHMR 官方评估一致），
-    # 所以 transl_c 和渲染用的 K 天然一致，无需任何备份/fallback。
+    # --- 5. incam renderer ---
+    # SMPL 的 trans (incam) 是在 HPE 推理时基于 estimate_K 生成的，
+    # 所以渲染必须使用同样的 K，否则 mesh 尺寸和位置会不匹配。
+    # 优先级：hpe_K > estimate_K > camera_params.intrinsics (GT K)
     K_fullimg = None
-    if data.camera_params and data.camera_params.intrinsics is not None:
-        K_cur = data.camera_params.intrinsics
-        if isinstance(K_cur, np.ndarray):
-            K_fullimg = torch.from_numpy(K_cur).float()
+    
+    # 1) 优先使用 HPE 推理时的 K（与 SMPL trans 一致）
+    hpe_K = data.metadata.get('hpe_K')
+    if hpe_K is not None:
+        if isinstance(hpe_K, np.ndarray):
+            K_fullimg = torch.from_numpy(hpe_K).float()
         else:
-            K_fullimg = K_cur.float()
-        logger.info(f"[incam_global_gvhmr] Using camera_params K: "
+            K_fullimg = hpe_K.float()
+        logger.info(f"[incam_global_gvhmr] Using hpe_K (estimate_K from HPE): "
                     f"fx={float(K_fullimg[0,0]):.2f}, fy={float(K_fullimg[1,1]):.2f}, "
                     f"cx={float(K_fullimg[0,2]):.2f}, cy={float(K_fullimg[1,2]):.2f}")
-    elif data.annotations and 'camera' in data.annotations:
-        gt_intr = data.annotations['camera'].get('intrinsics')
-        if gt_intr is not None:
-            if isinstance(gt_intr, np.ndarray):
-                K_fullimg = torch.from_numpy(gt_intr).float()
-            else:
-                K_fullimg = gt_intr.float()
-            logger.info(f"[incam_global_gvhmr] Using GT K from annotations: "
-                        f"fx={float(K_fullimg[0,0]):.2f}, fy={float(K_fullimg[1,1]):.2f}, "
-                        f"cx={float(K_fullimg[0,2]):.2f}, cy={float(K_fullimg[1,2]):.2f}")
+    
+    # 2) fallback: 重新计算 estimate_K
     if K_fullimg is None:
-        logger.warning("[incam_global_gvhmr] No K_fullimg found, using estimated focal length")
         from hmr4d.utils.geo.hmr_cam import estimate_K
         K_fullimg = estimate_K(W, H)
+        logger.warning(f"[incam_global_gvhmr] hpe_K not found in metadata, "
+                      f"falling back to estimate_K(W={W}, H={H}): "
+                      f"fx={float(K_fullimg[0,0]):.2f}, fy={float(K_fullimg[1,1]):.2f}")
+    
+    # 同时记录 GT K 以便对比调试
+    if data.camera_params and data.camera_params.intrinsics is not None:
+        gt_K = data.camera_params.intrinsics
+        if isinstance(gt_K, torch.Tensor):
+            gt_K = gt_K.cpu().numpy()
+        logger.info(f"[incam_global_gvhmr] (FYI) GT K from camera_params: "
+                    f"fx={float(gt_K[0,0]):.2f}, fy={float(gt_K[1,1]):.2f}, "
+                    f"cx={float(gt_K[0,2]):.2f}, cy={float(gt_K[1,2]):.2f}")
 
     incam_renderer = GVHMRRenderer(W, H, device=device, faces=faces_smpl, K=K_fullimg)
 

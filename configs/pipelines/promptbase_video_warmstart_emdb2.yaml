@@ -25,6 +25,17 @@ components:
       use_cache: true
       overwrite: false
 
+  - type: slam
+    name: camera_estimation
+    backend: droid
+    use_masks: true
+    align_to_world: true
+    return_keyframe_info: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
   # 2. PromptHMR Preprocessing (HPE)
   - type: hpe
     name: gvhmr_preprocessing
@@ -40,13 +51,21 @@ components:
     img_size: 896
     use_mean_shape: true
     # 子步骤缓存：VitPose + Image Model 结果缓存到磁盘
-    substep_cache_use: true
-    substep_cache_overwrite: false
+    substep_cache_use: false
+    substep_cache_overwrite: true
     cache:
       enabled: true
-      use_cache: true
-      overwrite: false
-
+      use_cache: false
+      overwrite: true
+      
+  - type: world_transform
+    name: world_transform
+    use_smooth_cam: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
   # # 3. Skating Removal (后处理)
   # - type: skating_removal
   #   name: skating_removal
@@ -65,7 +84,7 @@ components:
     pre_dis: 5
     num_adjacent_frames: 1
     device: "cuda"
-    render_mode: "gvhmr_world"
+    render_mode: "prompthmr_camera"
     frame_selection_mode: "uniform"
     mesh_color_mode: "colorful"
     uniform_mesh_color: [0.75, 0.75, 0.75]
@@ -89,7 +108,7 @@ components:
     use_warmstart_poses: false
     use_rendered_for_keyframes: true  # 关键帧使用渲染图像（带 SMPL mesh）
     keyframe_render_mode: "adaptive"  # 所有关键帧（即所有渲染帧）都使用渲染图像
-    texture_threshold: 5.0
+    texture_threshold: 1
     cache:
       enabled: true
       use_cache: false
@@ -118,18 +137,14 @@ hooks:
   - stage: 'after_camera_estimation_warmstart'
     function: 'lib.pipeline.hooks.visualize_camera_trajectory'
     enabled: true
+
   - stage: 'after_gvhmr_preprocessing'
     function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
     enabled: true
     params:
       output_subdir: 'incam_global_pre_skating'
       frame_range: [0, 5]
-  - stage: 'after_skating_removal'
-    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
-    enabled: true
-    params:
-      output_subdir: 'incam_global_post_skating'
-      frame_range: [0, 5]
+
   - stage: 'before_evaluation'
     function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
     enabled: true
