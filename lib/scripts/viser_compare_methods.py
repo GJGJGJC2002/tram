@@ -727,6 +727,12 @@ class ViserCompareConfig:
     subsample: int = 1
     """帧采样间隔（大序列建议设为 2-5 以加速加载）"""
 
+    start_frame: int = 0
+    """起始帧索引（截取片段起点，0-based）"""
+
+    end_frame: int = -1
+    """结束帧索引（截取片段终点，-1 表示到最后一帧）"""
+
     align: bool = True
     """是否对所有方法做 ensure_y_up + move_to_start_point_face_z 对齐"""
 
@@ -749,6 +755,7 @@ def main(cfg: ViserCompareConfig):
     print(f"Sequence: {cfg.sequence}")
     print(f"Methods: {cfg.methods}")
     print(f"Subsample: {cfg.subsample}, Align: {cfg.align}, Spread: {cfg.spread}")
+    print(f"Frame range: [{cfg.start_frame}, {cfg.end_frame}]")
     print(f"{'='*60}\n")
 
     methods_data = {}
@@ -762,17 +769,6 @@ def main(cfg: ViserCompareConfig):
         print(f"[{i+1}/{len(cfg.methods)}] Loading {name} from {result_dir}/{cfg.sequence}/...")
 
         verts, traj = load_method_data(result_dir, cfg.sequence)
-
-        if cfg.align:
-            # Step 1: 确保 Y-up（检测并修正翻转）
-            verts = ensure_y_up(verts)
-            # Step 2: 归一化到原点、脚落地、面朝 Z
-            print(f"  Aligning (move_to_start_point_face_z)...")
-            verts = move_to_start_point_face_z(verts)
-            # 重新计算 trajectory（root joint from aligned vertices）
-            J_reg = _get_J_regressor()
-            joints = torch.einsum('jv,fvi->fji', J_reg.cpu(), verts)
-            traj = joints[:, 0, :].numpy()
 
         color = METHOD_COLORS[i % len(METHOD_COLORS)]
         methods_data[name] = {
@@ -789,13 +785,6 @@ def main(cfg: ViserCompareConfig):
             gt_verts, gt_traj = load_gt_data(
                 cfg.dataset_root, cfg.sequence, cfg.gt_split
             )
-            if cfg.align:
-                gt_verts = ensure_y_up(gt_verts)
-                gt_verts = move_to_start_point_face_z(gt_verts)
-                J_reg = _get_J_regressor()
-                joints = torch.einsum('jv,fvi->fji', J_reg.cpu(), gt_verts)
-                gt_traj = joints[:, 0, :].numpy()
-
             methods_data['GT'] = {
                 'vertices': gt_verts,
                 'trajectory': gt_traj,
@@ -814,6 +803,34 @@ def main(cfg: ViserCompareConfig):
         for name in methods_data:
             methods_data[name]['vertices'] = methods_data[name]['vertices'][:min_frames]
             methods_data[name]['trajectory'] = methods_data[name]['trajectory'][:min_frames]
+
+    # 帧范围截取（在对齐之前，使对齐基于截取片段的起点）
+    sf = max(0, cfg.start_frame)
+    ef = cfg.end_frame if cfg.end_frame > 0 else min_frames
+    ef = min(ef, min_frames)
+    if sf >= ef:
+        raise ValueError(f"Invalid frame range: start_frame={sf} >= end_frame={ef}")
+    if sf > 0 or ef < min_frames:
+        print(f"Clipping frames [{sf}, {ef}) -> {ef - sf} frames")
+        for name in methods_data:
+            methods_data[name]['vertices'] = methods_data[name]['vertices'][sf:ef]
+            methods_data[name]['trajectory'] = methods_data[name]['trajectory'][sf:ef]
+        min_frames = ef - sf
+
+    # 对齐（基于截取后的片段，起点归一化到原点）
+    if cfg.align:
+        print(f"\nAligning all methods...")
+        for name in methods_data:
+            print(f"  [{name}]")
+            verts = methods_data[name]['vertices']
+            verts = ensure_y_up(verts)
+            print(f"  Aligning (move_to_start_point_face_z)...")
+            verts = move_to_start_point_face_z(verts)
+            J_reg = _get_J_regressor()
+            joints = torch.einsum('jv,fvi->fji', J_reg.cpu(), verts)
+            traj = joints[:, 0, :].numpy()
+            methods_data[name]['vertices'] = verts
+            methods_data[name]['trajectory'] = traj
 
     # 沿 X 轴平移使各方法不重叠
     if cfg.spread and len(methods_data) > 1:

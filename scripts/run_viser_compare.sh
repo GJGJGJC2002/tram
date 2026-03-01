@@ -17,14 +17,16 @@ conda activate alignHMR
 # ---------- 可配置参数 ----------
 SEQ="${SEQ:-19_indoor_walk_off_mvs}"
 PORT="${PORT:-8080}"
-SUBSAMPLE="${SUBSAMPLE:-10}"
+SUBSAMPLE="${SUBSAMPLE:-30}"
 SHOW_GT="${SHOW_GT:-1}"
 DATASET_ROOT="${DATASET_ROOT:-datasets/EMDB}"
 SPREAD_GAP="${SPREAD_GAP:-1.0}"
 NO_SPREAD="${NO_SPREAD:-0}"
+START_FRAME="${START_FRAME:-0}"
+END_FRAME="${END_FRAME:--1}"
 
 # 方法列表（格式: Name:result_dir，空格分隔）
-METHODS="${METHODS:-tram:results/emdb_basic Ours:results/promptbase_video_warmstart_emdb2}"
+METHODS="${METHODS:-Prompt:results/promptbase_video_warmstart_emdb2 Ours:results/gvhmr_base_warmstart}"
 # ------------------------------------
 
 echo "=========================================="
@@ -34,6 +36,7 @@ echo "序列: $SEQ"
 echo "方法: $METHODS"
 echo "端口: $PORT"
 echo "帧采样: $SUBSAMPLE"
+echo "帧范围: [$START_FRAME, $END_FRAME]"
 echo "显示GT: $SHOW_GT"
 echo "方法间距: $SPREAD_GAP m"
 echo "=========================================="
@@ -42,6 +45,8 @@ CMD="python lib/scripts/viser_compare_methods.py \
     --sequence $SEQ \
     --methods $METHODS \
     --subsample $SUBSAMPLE \
+    --start-frame $START_FRAME \
+    --end-frame $END_FRAME \
     --spread-gap $SPREAD_GAP \
     --port $PORT"
 

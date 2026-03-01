@@ -33,8 +33,8 @@ components:
     return_keyframe_info: true
     cache:
       enabled: true
-      use_cache: true
-      overwrite: false
+      use_cache: false
+      overwrite: true
 
   # 2. PromptHMR Preprocessing (HPE)
   - type: hpe
@@ -55,17 +55,17 @@ components:
     substep_cache_overwrite: true
     cache:
       enabled: true
-      use_cache: false
-      overwrite: true
+      use_cache: true
+      overwrite: false
       
-  - type: world_transform
-    name: world_transform
-    use_smooth_cam: true
-    device: "cuda"
-    cache:
-      enabled: true
-      use_cache: false
-      overwrite: true
+  # - type: world_transform
+  #   name: world_transform
+  #   use_smooth_cam: true
+  #   device: "cuda"
+  #   cache:
+  #     enabled: true
+  #     use_cache: false
+  #     overwrite: true
   # # 3. Skating Removal (后处理)
   # - type: skating_removal
   #   name: skating_removal
@@ -79,40 +79,40 @@ components:
   #     overwrite: true
 
   # 4. Adjacent Frame SMPL Rendering (gvhmr_world mode)
-  - type: adjacent_smpl_renderer
-    name: adjacent_frame_rendering
-    pre_dis: 5
-    num_adjacent_frames: 1
-    device: "cuda"
-    render_mode: "prompthmr_camera"
-    frame_selection_mode: "uniform"
-    mesh_color_mode: "colorful"
-    uniform_mesh_color: [0.75, 0.75, 0.75]
-    mesh_render_style: "solid"  # 'solid' (实心填充) 或 'contour' (只画轮廓边缘，保留背景纹理)
-    contour_thickness: 3  # contour 模式下轮廓线宽度（像素）
-    gvhmr_root: "thirdparty/GVHMR"
-    cache:
-      enabled: true
-      use_cache: false
-      overwrite: true
+  # - type: adjacent_smpl_renderer
+  #   name: adjacent_frame_rendering
+  #   pre_dis: 5
+  #   num_adjacent_frames: 1
+  #   device: "cuda"
+  #   render_mode: "prompthmr_camera"
+  #   frame_selection_mode: "uniform"
+  #   mesh_color_mode: "colorful"
+  #   uniform_mesh_color: [0.75, 0.75, 0.75]
+  #   mesh_render_style: "solid"  # 'solid' (实心填充) 或 'contour' (只画轮廓边缘，保留背景纹理)
+  #   contour_thickness: 3  # contour 模式下轮廓线宽度（像素）
+  #   gvhmr_root: "thirdparty/GVHMR"
+  #   cache:
+  #     enabled: true
+  #     use_cache: false
+  #     overwrite: true
 
-  # 5. SLAM Warmstart (使用 rendered_indices 作为 forced keyframes)
-  # 无需第一次 SLAM，自动从 adjacent_render_info 获取关键帧列表
-  - type: slam
-    name: camera_estimation_warmstart
-    backend: droid_warmstart
-    use_masks: true
-    align_to_world: true
-    image_dir: null  # 自动从 adjacent_render_info 获取
-    enable_scale_alignment: false  # 无第一次 SLAM，不做尺度对齐
-    use_warmstart_poses: false
-    use_rendered_for_keyframes: true  # 关键帧使用渲染图像（带 SMPL mesh）
-    keyframe_render_mode: "adaptive"  # 所有关键帧（即所有渲染帧）都使用渲染图像
-    texture_threshold: 1
-    cache:
-      enabled: true
-      use_cache: false
-      overwrite: true
+  # # 5. SLAM Warmstart (使用 rendered_indices 作为 forced keyframes)
+  # # 无需第一次 SLAM，自动从 adjacent_render_info 获取关键帧列表
+  # - type: slam
+  #   name: camera_estimation_warmstart
+  #   backend: droid_warmstart
+  #   use_masks: true
+  #   align_to_world: true
+  #   image_dir: null  # 自动从 adjacent_render_info 获取
+  #   enable_scale_alignment: false  # 无第一次 SLAM，不做尺度对齐
+  #   use_warmstart_poses: false
+  #   use_rendered_for_keyframes: true  # 关键帧使用渲染图像（带 SMPL mesh）
+  #   keyframe_render_mode: "adaptive"  # 所有关键帧（即所有渲染帧）都使用渲染图像
+  #   texture_threshold: 1
+  #   cache:
+  #     enabled: true
+  #     use_cache: false
+  #     overwrite: true
 
   # 6. Evaluation (EMDB1: incam metrics only)
   - type: evaluation
