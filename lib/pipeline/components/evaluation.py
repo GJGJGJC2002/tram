@@ -62,6 +62,9 @@ class EvaluationComponent(Component):
         self._smplx2smpl = None
         self._J_regressor = None
         
+        # 3DPW 评估用 J_regressor_h36m（延迟加载）
+        self._J_regressor_h36m_14 = None
+        
         self._is_setup = True
         self.logger.info("Evaluation component initialized")
     
@@ -90,6 +93,29 @@ class EvaluationComponent(Component):
         )
         self.logger.info("Loaded GVHMR SMPL-X model + smplx2smpl + J_regressor for evaluation")
     
+    def _ensure_j_regressor_h36m(self):
+        """延迟加载 J_regressor_h36m 的 14 关节子集（用于 3DPW 评估）"""
+        if self._J_regressor_h36m_14 is not None:
+            return
+        
+        import os
+        from lib.core.constants import H36M_TO_J14
+        
+        j_reg_path = os.path.join('data', 'smpl', 'J_regressor_h36m.npy')
+        if not os.path.exists(j_reg_path):
+            raise FileNotFoundError(
+                f"J_regressor_h36m.npy not found at {j_reg_path}. "
+                "Required for 3DPW evaluation."
+            )
+        
+        J_regressor_h36m = np.load(j_reg_path)  # (17, 6890)
+        J_regressor_h36m_14 = J_regressor_h36m[H36M_TO_J14]  # (14, 6890)
+        self._J_regressor_h36m_14 = torch.from_numpy(J_regressor_h36m_14).float()
+        self.logger.info(
+            f"Loaded J_regressor_h36m[H36M_TO_J14] for 3DPW evaluation: "
+            f"shape={self._J_regressor_h36m_14.shape}"
+        )
+    
     def validate_input(self, data: PipelineData) -> bool:
         """验证输入：需要预测结果和 GT 标注"""
         has_predictions = data.smpl_params is not None
@@ -100,11 +126,23 @@ class EvaluationComponent(Component):
         """执行评估"""
         self.logger.info(f"Computing metrics: {self.metrics_to_compute}")
         
+        is_3dpw = data.metadata.get('dataset_type') == '3dpw'
+        
         # 加载 GT 数据
-        gt_data = self._load_gt_data(data)
+        if is_3dpw:
+            gt_data = self._load_gt_data_3dpw(data)
+        else:
+            gt_data = self._load_gt_data(data)
         
         # 计算预测的 SMPL 输出
         pred_data = self._compute_pred_smpl(data)
+        
+        # 3DPW: 将 pred joints/verts 也用 J_regressor_h36m_14 回归
+        if is_3dpw:
+            self._ensure_j_regressor_h36m()
+            j_reg = self._J_regressor_h36m_14
+            pred_data['pred_j3d'] = torch.matmul(j_reg, pred_data['pred_vert'])
+            pred_data['pred_j3d_w'] = torch.matmul(j_reg, pred_data['pred_vert_w'])
         
         # 应用 valid mask
         valid_mask = data.valid_frames_mask if data.valid_frames_mask is not None else gt_data.get('valid_mask')
@@ -114,9 +152,13 @@ class EvaluationComponent(Component):
         metrics = {}
         m2mm = 1e3  # 米转毫米
         
+        # 3DPW 使用 pelvis_idxs=[2,3]（与 WHAM/GVHMR 一致），EMDB 使用 [1,2]
+        pelvis_idxs = [2, 3] if is_3dpw else [1, 2]
+        
         # === 局部运动评估 ===
         if any(m in self.metrics_to_compute for m in ['pa_mpjpe', 'mpjpe', 'pve']):
-            local_metrics = self._evaluate_local_motion(gt_data, pred_data, m2mm)
+            local_metrics = self._evaluate_local_motion(
+                gt_data, pred_data, m2mm, pelvis_idxs=pelvis_idxs)
             metrics.update(local_metrics)
         
         if 'accel' in self.metrics_to_compute:
@@ -259,6 +301,105 @@ class EvaluationComponent(Component):
         if sampled_indices is not None and valid_mask is not None:
             valid_mask = valid_mask[sampled_indices]
 
+        return {
+            'gender': gender,
+            'gt_j3d': gt_j3d,
+            'gt_vert': gt.vertices,
+            'gt_ori': axis_angle_to_matrix(tt(poses_root)),
+            'gt_j3d_cam': gt_j3d_cam,
+            'gt_vert_cam': gt_cam.vertices,
+            'ext': ext,
+            'valid_mask': valid_mask,
+        }
+    
+    def _load_gt_data_3dpw(self, data: PipelineData) -> Dict[str, Any]:
+        """
+        加载 3DPW GT 数据。
+        
+        与 EMDB 的关键差异：
+        - 使用 J_regressor_h36m[H36M_TO_J14] (14 关节) 而非 SMPL joints[:24]
+        - pelvis_idxs = [2, 3]（与 WHAM/GVHMR 评估一致）
+        - betas 只取前 10 维
+        """
+        from lib.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle
+        
+        self._ensure_j_regressor_h36m()
+        j_reg = self._J_regressor_h36m_14  # (14, 6890)
+        
+        ann = data.annotations
+        
+        # 检查帧采样
+        sampling_info = data.metadata.get('frame_sampling')
+        if sampling_info:
+            sampled_indices = np.array(sampling_info['sampled_indices'])
+            self.logger.info(
+                f"[3DPW] Applying frame sampling to GT: "
+                f"{ann['n_frames']} -> {len(sampled_indices)} frames"
+            )
+        else:
+            sampled_indices = None
+        
+        gender = ann['gender']
+        poses_body = ann['smpl']['poses_body']     # (N, 69)
+        poses_root = ann['smpl']['poses_root']     # (N, 3)
+        betas_1d = ann['smpl']['betas']            # (10,)
+        trans = ann['smpl']['trans']               # (N, 3)
+        ext = ann['camera']['extrinsics']          # (N, 4, 4)
+        
+        n_frames = ann['n_frames']
+        betas = np.repeat(betas_1d.reshape(1, -1), repeats=n_frames, axis=0)  # (N, 10)
+        
+        # 应用采样
+        if sampled_indices is not None:
+            poses_body = poses_body[sampled_indices]
+            poses_root = poses_root[sampled_indices]
+            betas = betas[sampled_indices]
+            trans = trans[sampled_indices]
+            ext = ext[sampled_indices]
+        
+        tt = lambda x: torch.from_numpy(x).float()
+        
+        # 世界坐标系下的 GT SMPL
+        gt = self._smpls[gender](
+            body_pose=tt(poses_body),
+            global_orient=tt(poses_root),
+            betas=tt(betas),
+            transl=tt(trans),
+            pose2rot=True,
+            default_smpl=True,
+        )
+        
+        # 相机坐标系下的 GT SMPL
+        poses_root_cam = matrix_to_axis_angle(
+            tt(ext[:, :3, :3]) @ axis_angle_to_matrix(tt(poses_root))
+        )
+        # cam_trans = R_w2c @ trans_w + t_w2c
+        cam_trans = (
+            torch.einsum('bij,bj->bi', tt(ext[:, :3, :3]), tt(trans))
+            + tt(ext[:, :3, 3])
+        )
+        gt_cam = self._smpls[gender](
+            body_pose=tt(poses_body),
+            global_orient=poses_root_cam,
+            betas=tt(betas),
+            transl=cam_trans,
+            pose2rot=True,
+            default_smpl=True,
+        )
+        
+        # 用 J_regressor_h36m_14 回归 14 关节
+        gt_j3d = torch.matmul(j_reg, gt.vertices)          # (N, 14, 3)
+        gt_j3d_cam = torch.matmul(j_reg, gt_cam.vertices)  # (N, 14, 3)
+        
+        self.logger.info(
+            f"[3DPW] GT loaded: {gt_j3d.shape[0]} frames, "
+            f"{gt_j3d.shape[1]} joints (J_regressor_h36m_14), gender={gender}"
+        )
+        
+        valid_mask = ann.get('good_frames_mask')
+        if sampled_indices is not None and valid_mask is not None:
+            valid_mask = valid_mask[sampled_indices]
+        
         return {
             'gender': gender,
             'gt_j3d': gt_j3d,
@@ -463,17 +604,20 @@ class EvaluationComponent(Component):
         
         return gt_data, pred_data
     
-    def _evaluate_local_motion(self, gt_data, pred_data, m2mm):
+    def _evaluate_local_motion(self, gt_data, pred_data, m2mm, pelvis_idxs=None):
         """评估局部运动"""
         from lib.utils.eval_utils import (
             batch_align_by_pelvis, 
             batch_compute_similarity_transform_torch
         )
         
+        if pelvis_idxs is None:
+            pelvis_idxs = [1, 2]
+        
         pred_j3d, gt_j3d_cam, pred_vert, gt_vert_cam = batch_align_by_pelvis(
             [pred_data['pred_j3d'], gt_data['gt_j3d_cam'], 
              pred_data['pred_vert'], gt_data['gt_vert_cam']], 
-            pelvis_idxs=[1, 2]
+            pelvis_idxs=pelvis_idxs
         )
         
         metrics = {}

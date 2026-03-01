@@ -15,15 +15,15 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate alignHMR
 
 # ---------- 可配置参数 ----------
-SEQ="${SEQ:-19_indoor_walk_off_mvs}"
+SEQ="${SEQ:-28_outdoor_walk_lunges}"
 PORT="${PORT:-8080}"
-SUBSAMPLE="${SUBSAMPLE:-30}"
+SUBSAMPLE="${SUBSAMPLE:-20}"
 SHOW_GT="${SHOW_GT:-1}"
 DATASET_ROOT="${DATASET_ROOT:-datasets/EMDB}"
 SPREAD_GAP="${SPREAD_GAP:-1.0}"
 NO_SPREAD="${NO_SPREAD:-0}"
-START_FRAME="${START_FRAME:-0}"
-END_FRAME="${END_FRAME:--1}"
+START_FRAME="${START_FRAME:-400}"
+END_FRAME="${END_FRAME:-600}"
 
 # 方法列表（格式: Name:result_dir，空格分隔）
 METHODS="${METHODS:-Prompt:results/promptbase_video_warmstart_emdb2 Ours:results/gvhmr_base_warmstart}"

@@ -1,0 +1,170 @@
+# PromptHMR + SLAM WorldTransform + OAR Depth Refinement Pipeline (3DPW)
+#
+# 与 EMDB1 版本类似，但：
+#   - 在 Segmentation 前插入 Detection 组件（3DPW 无 GT bbox）
+#   - 评估仅计算 incam 指标（pa_mpjpe, mpjpe, pve, accel）
+#   - 使用 J_regressor_h36m 14 关节子集（与 WHAM/GVHMR 评估一致）
+#
+# Pipeline 流程：
+#   1. Detection (VitDet) - 人体检测（生成 bbox）
+#   2. Segmentation (SAM) - 人体分割
+#   3. SLAM (DROID) - 相机运动估计
+#   4. HPE (PromptHMR) - 人体姿态估计（static_cam=True）
+#   5. WorldTransform - 用 SLAM c2w 变换到世界坐标系
+#   6. DepthSceneRefine (OAR) - 滑动窗口光学锚定精修
+#   7. Evaluation - 3DPW 评估
+
+name: "PromptHMR + OAR DepthRefine (3DPW)"
+mode: "sequential"
+device: "cuda"
+output_dir: "results/promptbase_video_depthrefine_3dpw"
+
+components:
+  # 1. 人体检测（3DPW 无 GT bbox，需通过 VitDet 检测）
+  - type: detection
+    name: human_detection
+    backend: vitdet
+    threshold: 0.5
+    min_size: 100
+    max_detections: 1
+    arrange_mode: size
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 2. 人体分割
+  - type: segmentation
+    name: human_segmentation
+    backend: sam
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 3. 相机运动估计（DROID-SLAM, 保留关键帧信息）
+  - type: slam
+    name: camera_estimation
+    backend: droid
+    use_masks: true
+    align_to_world: true
+    return_keyframe_info: true
+    cache:
+      enabled: true
+      use_cache: true
+      overwrite: false
+
+  # 4. PromptHMR HPE（static_cam=True）
+  - type: hpe
+    name: gvhmr_preprocessing
+    backend: prompthmr
+    prompthmr_root: "../PromptHMR"
+    gvhmr_root: "thirdparty/GVHMR"
+    static_cam: true
+    f_mm: null
+    phmr_ckpt: "data/pretrain/phmr/checkpoint.ckpt"
+    phmr_vid_cfg: "data/pretrain/phmr_vid/prhmr_release_002.yaml"
+    phmr_vid_ckpt: "data/pretrain/phmr_vid/prhmr_release_002.ckpt"
+    mask_prompt: true
+    img_size: 896
+    use_mean_shape: true
+    substep_cache_use: false
+    substep_cache_overwrite: true
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 5. 世界坐标系变换
+  - type: world_transform
+    name: world_transform
+    use_smooth_cam: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 6. OAR 深度精修
+  - type: depth_scene_refine
+    name: oar_refine
+    metric3d_model: "metric3d_vit_small"
+    metric3d_root: "thirdparty/PromptHMR/pipeline/yvanyin_metric3d_main"
+    prompthmr_root: "thirdparty/PromptHMR"
+    gvhmr_root: "thirdparty/GVHMR"
+    # 滑动窗口参数
+    window_size: 21
+    stride: 5
+    sigma: 5.0
+    # 优化参数
+    opt_steps: 2
+    opt_lr: 0.01
+    # 损失权重
+    loss_reproj_w: 0
+    loss_depth_w: 1.0
+    loss_smooth_vel_w: 0.25
+    loss_smooth_acc_w: 0.25
+    loss_contact_vel_w: 1000.0
+    loss_contact_height_w: 1.0
+    loss_floor_w: 1.0
+    loss_reg_w: 0.1
+    # 功能开关
+    enable_depth_constraint: false
+    enable_rollback_check: false
+    enable_ik: false
+    enable_orient_refine: false
+    opt_contact: false
+    # 图像模型 3D body pose 纠正
+    enable_img_pose_refine: true
+    img_pose_opt_steps: 30
+    img_pose_opt_lr: 0.005
+    loss_img3d_w: 5.0
+    loss_img3d_sigma: 0.1
+    loss_bodypose_reg_w: 0.1
+    # 深度帧采样
+    depth_frame_stride: 5
+    metric3d_batch_size: 4
+    save_depth_maps: false
+    fps: 30
+    device: "cuda"
+    # OAR 诊断可视化
+    vis_oar_diagnostics: true
+    vis_oar_frame_stride: 5
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
+
+  # 7. 评估（3DPW: incam 指标，J_regressor_h36m 14 关节）
+  - type: evaluation
+    name: evaluation
+    metrics:
+      - pa_mpjpe
+      - mpjpe
+      - pve
+      - accel
+    chunk_length: 100
+    fps: 30
+
+# Hooks
+hooks:
+  - stage: 'after_gvhmr_preprocessing'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_skating'
+      frame_range: [0, 5]
+
+  - stage: 'after_world_transform'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_pre_oar'
+      frame_range: [0, 50]
+
+  - stage: 'after_oar_refine'
+    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
+    enabled: true
+    params:
+      output_subdir: 'incam_global_post_oar'
+      frame_range: [0, 50]

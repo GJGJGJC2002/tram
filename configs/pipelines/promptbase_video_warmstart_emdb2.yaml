@@ -33,8 +33,8 @@ components:
     return_keyframe_info: true
     cache:
       enabled: true
-      use_cache: false
-      overwrite: true
+      use_cache: true
+      overwrite: false
 
   # 2. PromptHMR Preprocessing (HPE)
   - type: hpe
@@ -66,17 +66,17 @@ components:
   #     enabled: true
   #     use_cache: false
   #     overwrite: true
-  # # 3. Skating Removal (后处理)
-  # - type: skating_removal
-  #   name: skating_removal
-  #   gvhmr_root: "thirdparty/GVHMR"
-  #   enable_static_joint: true
-  #   enable_ik: true
-  #   device: "cuda"
-  #   cache:
-  #     enabled: true
-  #     use_cache: false
-  #     overwrite: true
+  # 3. Skating Removal (后处理)
+  - type: skating_removal
+    name: skating_removal
+    gvhmr_root: "thirdparty/GVHMR"
+    enable_static_joint: true
+    enable_ik: true
+    device: "cuda"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
 
   # 4. Adjacent Frame SMPL Rendering (gvhmr_world mode)
   # - type: adjacent_smpl_renderer
