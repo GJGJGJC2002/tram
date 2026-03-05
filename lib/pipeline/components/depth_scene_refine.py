@@ -1,29 +1,31 @@
 """DepthSceneRefineComponent - 光学锚定 + 场景感知的滑动窗口精修组件 (OAR)
 
-基于 Metric3D 深度图 + 2D 重投影约束，以滑动窗口方式优化世界坐标系下的
-global_orient 和 body_pose。
+基于 Metric3D 深度图 + 2D 重投影约束，以滑动窗口方式精修
+global_trans / body_pose。
 
 核心流程:
-1. 对均匀采样帧调用 Metric3D 生成度量深度图
-2. SMPL-X forward 预计算世界坐标系关节点
-3. 滑动窗口遍历序列，每个窗口中心帧做 Adam 优化:
-   - 重投影 loss: proj(joints) vs 2D 关键点
-   - 深度穿透 loss: SMPL 关节 z vs 场景深度
-   - 平滑/接触/地面约束
-4. 高斯衰减传播修正量到窗口内其他帧
-5. 归一化合并所有窗口
-6. IK 修正 body_pose
+1. 加载 Metric3D 模型（窗口循环期间保持常驻）
+2. FK 预计算世界坐标系关节点
+3. 滑动窗口遍历序列，每个窗口：
+   a. 对中心帧按需推理单张深度图
+   b. Adam 优化中心帧 delta_t:
+      - 重投影 loss: proj(joints) vs 2D 关键点
+      - 深度 loss: 相机坐标系 z_smpl vs z_scene（深度 scale 对齐）
+      - 平滑 + 正则化
+   c. 高斯衰减传播 delta_t 到窗口邻居帧
+   d. 窗口内滑步修正（ik: 旋转矩阵加权平均 / pp_static_joint: transl 修正）
+4. 卸载 Metric3D
+5. 全局高斯合并写回 data 供 eval
+6. 最终重投影可视化
 """
 
 import sys
 import os
 import gc
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-import logging
 from PIL import Image
 
 from lib.pipeline.core.component import Component
@@ -50,7 +52,6 @@ class DepthSceneRefineComponent(Component):
         'metric3d_model': 'metric3d_vit_small',
         'metric3d_root': 'thirdparty/PromptHMR/pipeline/yvanyin_metric3d_main',
         'prompthmr_root': 'thirdparty/PromptHMR',
-        'metric3d_batch_size': 32,
         # 滑动窗口
         'window_size': 21,
         'stride': 5,
@@ -63,17 +64,18 @@ class DepthSceneRefineComponent(Component):
         'loss_depth_w': 1.0,
         'loss_smooth_vel_w': 0.01,
         'loss_smooth_acc_w': 0.01,
-        'loss_contact_vel_w': 100.0,
-        'loss_contact_height_w': 1.0,
-        'loss_floor_w': 5.0,
         'loss_reg_w': 0.01,
         'reproj_sigma': 50,
         'depth_sigma': 1.0,
         # 功能开关
         'enable_depth_constraint': True,
         'enable_ik': True,
+        # 窗口内滑步修正模式: 'ik' / 'pp_static_joint' / 'none'
+        #   ik:              旋转矩阵空间加权平均修正 body_pose
+        #   pp_static_joint: 只修正 transl（静态关节位移修正平移轨迹）
+        #   none:            不做窗口内滑步修正
+        'window_skating_mode': 'ik',
         'enable_orient_refine': True,
-        'opt_contact': True,
         # 图像模型 3D body pose 纠正
         'enable_img_pose_refine': True,        # 是否用图像模型单帧 SMPL 纠正四肢 body_pose
         'img_pose_limb_joints': [1, 2, 4, 5, 7, 8, 10, 11, 16, 17, 18, 19, 20, 21],  # FK-22 中的四肢关节
@@ -82,10 +84,16 @@ class DepthSceneRefineComponent(Component):
         'loss_img3d_w': 5.0,                    # 3D 关节 loss 权重
         'loss_img3d_sigma': 0.1,                # gmof sigma（米）
         'loss_bodypose_reg_w': 0.1,             # body pose 正则化权重
+        # Depth Contact IK
+        'enable_depth_contact_ik': True,        # 是否用深度图穿透信号做 Contact IK
+        'contact_ik_steps': 30,                 # Contact IK 优化迭代次数
+        'contact_ik_lr': 0.003,                 # Contact IK 学习率
+        'loss_contact_w': 5.0,                  # 接触关节位置 loss 权重
+        'loss_contact_sigma': 0.05,             # gmof sigma（米）
+        'loss_contact_bp_reg_w': 0.1,           # body pose 正则化权重
+        'loss_contact_smooth_w': 0.5,           # 时序平滑权重
         # EnDecoder
         'gvhmr_root': 'thirdparty/GVHMR',
-        # 深度帧采样
-        'depth_frame_stride': 5,
         # 杂项
         'save_depth_maps': False,
         'fps': 30,
@@ -202,89 +210,48 @@ class DepthSceneRefineComponent(Component):
             gc.collect()
             torch.cuda.empty_cache()
 
-    def _infer_depth_maps(
+    def _infer_single_depth(
         self,
-        image_paths: List[str],
-        frame_indices: np.ndarray,
+        image_path: str,
         intrinsics: np.ndarray,
-        save_dir: Optional[str] = None,
-    ) -> Dict[int, torch.Tensor]:
-        """Run Metric3D on selected frames. Returns {frame_idx: depth_tensor_cpu}."""
+    ) -> torch.Tensor:
+        """对单帧推理 Metric3D 深度图（假设模型已加载）。
+
+        Args:
+            image_path: 图片路径
+            intrinsics: (3, 3) 相机内参
+
+        Returns:
+            depth: (H, W) CPU float tensor（米制深度）
+        """
         prompthmr_abs = os.path.abspath(self.config['prompthmr_root'])
         cam_dir = os.path.join(prompthmr_abs, 'pipeline', 'camera')
         if cam_dir not in sys.path:
             sys.path.insert(0, cam_dir)
         from depth_utils import prep_metric3d, post_metric3d
 
-        # Free GPU memory left over from previous pipeline stages before
-        # loading the (potentially large) Metric3D model.
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        self._load_metric3d()
-
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
         calib = [fx, fy, cx, cy]
         model_version = self.config['metric3d_model']
 
-        # Get prep params from first image
-        first_img = np.array(Image.open(image_paths[frame_indices[0]]).convert('RGB'))
-        _, intrinsic_prep, pad_info, rgb_origin = prep_metric3d(first_img, calib, model_version)
+        img = np.array(Image.open(image_path).convert('RGB'))
+        rgb_prep, intrinsic_prep, pad_info, rgb_origin = prep_metric3d(img, calib, model_version)
+        rgb_batch = rgb_prep.cuda().half()
 
-        depth_maps = {}
-        batch_size = self.config.get('metric3d_batch_size', 4)
+        with torch.inference_mode():
+            pred_depth, confidence, _ = self.metric3d_model.inference({'input': rgb_batch})
 
-        # Process in batches – use try/except to auto-reduce batch size on OOM
-        while batch_size >= 1:
-            try:
-                for batch_start in range(0, len(frame_indices), batch_size):
-                    batch_idxs = frame_indices[batch_start:batch_start + batch_size]
-                    batch_tensors = []
-                    for idx in batch_idxs:
-                        img = np.array(Image.open(image_paths[idx]).convert('RGB'))
-                        rgb_prep, _, _, _ = prep_metric3d(img, calib, model_version)
-                        batch_tensors.append(rgb_prep)
+        depth = post_metric3d(
+            pred_depth, confidence if confidence is not None else None,
+            pad_info, rgb_origin, intrinsic_prep
+        )
+        depth_cpu = depth.cpu().squeeze()
 
-                    rgb_batch = torch.cat(batch_tensors, dim=0).cuda().half()
+        del rgb_batch, pred_depth, confidence
+        torch.cuda.empty_cache()
 
-                    with torch.inference_mode():
-                        pred_depth, confidence, _ = self.metric3d_model.inference({'input': rgb_batch})
-
-                    # Post-process each frame
-                    for i, idx in enumerate(batch_idxs):
-                        depth_i = post_metric3d(
-                            pred_depth[i:i+1], confidence[i:i+1] if confidence is not None else None,
-                            pad_info, rgb_origin, intrinsic_prep
-                        )
-                        depth_maps[int(idx)] = depth_i.cpu().squeeze()
-
-                        if save_dir is not None:
-                            os.makedirs(save_dir, exist_ok=True)
-                            np.save(os.path.join(save_dir, f'depth_{int(idx):05d}.npy'),
-                                    depth_i.cpu().squeeze().numpy())
-
-                    # Free intermediates every batch
-                    del rgb_batch, pred_depth, confidence, batch_tensors
-                    torch.cuda.empty_cache()
-
-                break  # success
-            except torch.cuda.OutOfMemoryError:
-                # Clear partial results from this failed attempt for frames
-                # that haven't been stored yet, then retry with smaller batch
-                old_bs = batch_size
-                batch_size = max(1, batch_size // 2)
-                self.logger.warning(
-                    f"Metric3D OOM with batch_size={old_bs}, retrying with batch_size={batch_size}"
-                )
-                gc.collect()
-                torch.cuda.empty_cache()
-                if old_bs == 1:
-                    raise  # truly cannot fit even a single image
-
-        self._unload_metric3d()
-        self.logger.info(f"Generated {len(depth_maps)} depth maps for frames: {frame_indices.tolist()[:5]}...")
-        return depth_maps
+        return depth_cpu
 
     # ------------------------------------------------------------------
     # Projection helpers
@@ -305,266 +272,135 @@ class DepthSceneRefineComponent(Component):
         return pj_2d, j_cam
 
     # ------------------------------------------------------------------
-    # Core optimisation
+    # Window-level SMPL rendering (5 frames per window)
     # ------------------------------------------------------------------
-    def _sliding_window_optimize(
+    def _load_smplx_for_render(self):
+        """一次性加载 SMPL-X 模型和渲染器组件，返回 (smplx_model, smplx2smpl, faces_smpl)。"""
+        import sys
+        gvhmr_abs = os.path.abspath(self.config['gvhmr_root'])
+        if gvhmr_abs not in sys.path:
+            sys.path.insert(0, gvhmr_abs)
+
+        old_cwd = os.getcwd()
+        os.chdir(gvhmr_abs)
+        try:
+            from hmr4d.utils.smplx_utils import make_smplx
+            smplx_model = make_smplx("supermotion").to(self.device)
+            smplx2smpl = torch.load("hmr4d/utils/body_model/smplx2smpl_sparse.pt").to(self.device)
+            faces_smpl = make_smplx("smpl").faces
+        finally:
+            os.chdir(old_cwd)
+        return smplx_model, smplx2smpl, faces_smpl
+
+    def _render_window_smpl(
         self,
-        joints_world: torch.Tensor,   # (F, J, 3)
-        R_cw: torch.Tensor,            # (F, 3, 3)
-        t_cw: torch.Tensor,            # (F, 3)
-        K: torch.Tensor,               # (3, 3)
-        kp2d: Optional[torch.Tensor],  # (F, 17, 3) COCO-17 x,y,conf  or None
-        depth_maps: Dict[int, torch.Tensor],
-        contact_conf: Optional[torch.Tensor],  # (F, J_contact)
-        bbox_height: Optional[torch.Tensor],   # (F,)
-        masks: Optional[torch.Tensor],         # (F, H, W) human masks
-        img_h: int,
-        img_w: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Run sliding-window optimization. Returns (delta_transl, delta_orient_aa)."""
-        device = self.device
-        F_total = joints_world.shape[0]
-        window_size = self.config['window_size']
-        stride = self.config['stride']
-        sigma = self.config['sigma']
-        half_win = window_size // 2
-        fps = self.config['fps']
+        center: int,
+        global_orient_w: torch.Tensor,   # (F, 3) aa, full sequence
+        body_pose_aa: torch.Tensor,       # (win_len, 63) window-local body pose
+        betas: torch.Tensor,              # (F, 10) full sequence
+        win_transl: torch.Tensor,         # (win_len, 3) window-local transl
+        win_start: int,
+        win_end: int,
+        R_cw: torch.Tensor,               # (F, 3, 3)
+        t_cw: torch.Tensor,               # (F, 3)
+        K: torch.Tensor,                   # (3, 3)
+        image_paths: List[str],
+        output_dir: str,
+        tag: str = 'pre',
+        render_offsets: List[int] = None,
+        smplx_model=None,
+        smplx2smpl=None,
+        faces_smpl=None,
+        renderer=None,
+    ):
+        """渲染窗口内指定偏移帧的 SMPL mesh 到中心帧视角，保存 debug 图。
 
-        # Accumulators (on CPU to save GPU memory)
-        acc_delta_t = torch.zeros(F_total, 3)
-        acc_delta_orient = torch.zeros(F_total, 3)  # axis-angle delta
-        acc_weights = torch.zeros(F_total)
+        对中心帧，渲染 render_offsets 指定偏移的帧（默认 -10,-5,0,+5,+10），
+        所有 SMPL 用 w2c 投影到中心帧的相机坐标系下。
 
-        # Pre-compute gaussian weights for window positions
-        offsets = torch.arange(-half_win, half_win + 1).float()
-        gauss_w = torch.exp(-offsets ** 2 / (2 * sigma ** 2))
-        gauss_w = gauss_w / gauss_w.max()
+        Args:
+            body_pose_aa: (win_len, 63) 窗口级 body pose（可能被 IK 修正过）
+            global_orient_w: (F, 3) 全局序列的 orient（用全局索引访问）
+            betas: (F, 10) 全局序列的 shape（用全局索引访问）
+            win_transl: (win_len, 3) 窗口内独立 transl
+            smplx_model, smplx2smpl, faces_smpl: 外部传入避免重复加载
+            renderer: 外部传入的 Pytorch3dRenderer 实例
+        """
+        import cv2
 
-        # Contact joint ids (SMPL-22 FK: L_Foot=7, L_ToeBase=10, R_Foot=8, R_ToeBase=11)
-        contact_joint_ids = [7, 10, 8, 11]
-        # Number of joints actually available from FK
-        n_joints = joints_world.shape[1]  # typically 22 from fk_v2
-        # Also filter contact ids to valid range
-        contact_joint_ids = [j for j in contact_joint_ids if j < n_joints]
+        if render_offsets is None:
+            render_offsets = [-10, -5, 0, 5, 10]
 
-        # FK-22 → COCO-17 joint pair mapping for reprojection loss
-        # FK_idx: SMPL joint → COCO_idx: ViTPose detection
-        _FK_TO_COCO_PAIRS = [
-            # (fk_idx, coco_idx)
-            (1, 11),   # L_Hip → L_hip
-            (2, 12),   # R_Hip → R_hip
-            (4, 13),   # L_Knee → L_knee
-            (5, 14),   # R_Knee → R_knee
-            (7, 15),   # L_Ankle → L_ankle
-            (8, 16),   # R_Ankle → R_ankle
-            (16, 5),   # L_Shoulder → L_shoulder (NOT 13=L_Collar which is too medial)
-            (17, 6),   # R_Shoulder → R_shoulder (NOT 14=R_Collar which is too medial)
-            (18, 7),   # L_Elbow → L_elbow
-            (19, 8),   # R_Elbow → R_elbow
-            (20, 9),   # L_Wrist → L_wrist
-            (21, 10),  # R_Wrist → R_wrist
-        ]
-        # Filter pairs to valid FK joint range
-        fk_coco_pairs = [(fk, coco) for fk, coco in _FK_TO_COCO_PAIRS if fk < n_joints]
-        fk_pair_idxs = [p[0] for p in fk_coco_pairs]
-        coco_pair_idxs = [p[1] for p in fk_coco_pairs]
+        vis_dir = os.path.join(output_dir, f'oar_window_{tag}')
+        os.makedirs(vis_dir, exist_ok=True)
 
-        K_dev = K.to(device)
+        device = torch.device(self.device)
 
-        # --- 动态地面高度估计 ---
-        # 用脚部关节（L_Foot=7, R_Foot=8, L_ToeBase=10, R_ToeBase=11）的最低 Y 值估算地面
-        foot_y = joints_world[:, contact_joint_ids, 1]  # (F, 4)
-        floor_y = foot_y.min().item()
-        self.logger.info(
-            f"[OAR Ground Check] Joint Y stats: "
-            f"all_min={joints_world[:, :, 1].min():.3f}, all_max={joints_world[:, :, 1].max():.3f}, "
-            f"all_mean={joints_world[:, :, 1].mean():.3f} | "
-            f"foot_min={foot_y.min():.3f}, foot_max={foot_y.max():.3f}, "
-            f"foot_mean={foot_y.mean():.3f} | "
-            f"estimated_floor_y={floor_y:.3f}"
-        )
+        # 中心帧的 w2c
+        R_w2c_center = R_cw[center].to(device)
+        t_w2c_center = t_cw[center].to(device)
 
-        num_windows = 0
-        # Debug: 累计各项 loss 用于日志
-        _dbg_loss_sums = {
-            'reproj': 0.0, 'depth': 0.0, 'vel': 0.0, 'acc': 0.0,
-            'contact_h': 0.0, 'floor': 0.0, 'reg': 0.0, 'total': 0.0,
+        img_bg = cv2.imread(image_paths[center])
+
+        # 颜色表：不同偏移用不同颜色（从远过去到远未来：蓝→绿→红）
+        offset_colors = {
+            -10: [0.2, 0.4, 0.9],
+            -5:  [0.3, 0.7, 0.9],
+            0:   [0.5, 0.9, 0.5],
+            5:   [0.9, 0.7, 0.3],
+            10:  [0.9, 0.4, 0.2],
         }
-        _dbg_count = 0
+        default_color = [0.7, 0.7, 0.7]
 
-        for center in range(0, F_total, stride):
-            start = max(0, center - half_win)
-            end = min(F_total, center + half_win + 1)
-            win_len = end - start
-            center_local = center - start
+        canvas = img_bg.copy()
 
-            # Get data for this window on device
-            j_win = joints_world[start:end].to(device)  # (W, J, 3)
-            R_win = R_cw[start:end].to(device)
-            t_win = t_cw[start:end].to(device)
+        for offset in render_offsets:
+            global_idx = center + offset
+            if global_idx < win_start or global_idx >= win_end:
+                continue
+            if global_idx < 0 or global_idx >= len(image_paths):
+                continue
 
-            # Optimization variables for center frame
-            from lib.utils.rotation_conversions import (
-                axis_angle_to_matrix,
-                matrix_to_axis_angle,
-            )
+            local_idx = global_idx - win_start
 
-            delta_t = torch.zeros(3, device=device, requires_grad=True)
-
-            if self.config['enable_orient_refine']:
-                delta_orient_aa = torch.zeros(3, device=device, requires_grad=True)
-                opt_params = [delta_t, delta_orient_aa]
-            else:
-                delta_orient_aa = torch.zeros(3, device=device)
-                opt_params = [delta_t]
-
-            optimizer = torch.optim.Adam(opt_params, lr=self.config['opt_lr'])
-
-            for step in range(self.config['opt_steps']):
-                optimizer.zero_grad()
-
-                # Apply delta to center frame joints
-                delta_R = axis_angle_to_matrix(delta_orient_aa.unsqueeze(0))  # (1, 3, 3)
-                j_center_mod = (delta_R @ j_win[center_local].unsqueeze(-1)).squeeze(-1) + delta_t  # (J, 3)
-
-                # Project center frame
-                j_cam_center = (R_win[center_local] @ j_center_mod.unsqueeze(-1)).squeeze(-1) + t_win[center_local]  # (J, 3)
-                pj = (K_dev @ j_cam_center.unsqueeze(-1)).squeeze(-1)
-                pj_2d = pj[:, :2] / (pj[:, 2:3] + 1e-6)
-
-                total_loss = torch.tensor(0.0, device=device)
-                # Per-step loss tracking for debug
-                _step_losses = {}
-
-                # --- Loss 1: 2D reprojection (FK joints vs COCO-17 ViTPose) ---
-                if kp2d is not None and len(fk_coco_pairs) > 0:
-                    kp_center = kp2d[center].to(device)  # (17, 3)
-                    gt_2d = kp_center[coco_pair_idxs, :2]  # (N_pairs, 2)
-                    conf = kp_center[coco_pair_idxs, 2]    # (N_pairs,)
-                    proj_2d = pj_2d[fk_pair_idxs]          # (N_pairs, 2)
-
-                    reproj_err = gmof(proj_2d - gt_2d, sigma=self.config['reproj_sigma'])
-                    # 使用固定归一化常数代替 bbox_height，避免 reproj loss 被过度压缩
-                    reproj_err = reproj_err / 1000.0
-                    conf_mask = conf > 0.5
-                    loss_reproj = (conf_mask.unsqueeze(-1) * reproj_err).mean()
-                    total_loss = total_loss + self.config['loss_reproj_w'] * loss_reproj
-                    _step_losses['reproj'] = loss_reproj.item()
-
-                # --- Loss 2: Depth penetration ---
-                if self.config['enable_depth_constraint'] and depth_maps:
-                    actual_frame = center
-                    # Find nearest depth frame
-                    depth_frame = min(depth_maps.keys(), key=lambda k: abs(k - actual_frame))
-                    if abs(depth_frame - actual_frame) <= self.config['depth_frame_stride'] * 2:
-                        depth_map = depth_maps[depth_frame].to(device)
-                        dH, dW = depth_map.shape
-
-                        # Sample depth at projected joint locations
-                        u = pj_2d[:, 0].long().clamp(0, dW - 1)
-                        v = pj_2d[:, 1].long().clamp(0, dH - 1)
-                        z_smpl = j_cam_center[:, 2]
-                        z_scene = depth_map[v, u]
-
-                        # Penetration: SMPL joint is behind scene surface
-                        valid_depth = (z_scene > 0.1) & (z_scene < 100.0) & (z_smpl > 0)
-                        penetration = F.relu(z_smpl - z_scene - 0.05)  # 5cm margin
-                        loss_depth = gmof(penetration[valid_depth], sigma=self.config['depth_sigma']).mean() if valid_depth.any() else torch.tensor(0.0, device=device)
-                        total_loss = total_loss + self.config['loss_depth_w'] * loss_depth
-                        _step_losses['depth'] = loss_depth.item()
-
-                # --- Loss 3: Smoothness (on delta-modified transl trajectory) ---
-                # We use the original joints + propagated delta for smoothness
-                # For the window, create a modified trajectory
-                t_weights = gauss_w[start - center + half_win:end - center + half_win].to(device)
-                delta_t_propagated = t_weights.unsqueeze(-1) * delta_t.unsqueeze(0)  # (W, 3)
-                j_mod_transl = j_win[:, 0, :] + delta_t_propagated  # root joint trajectory (W, 3)
-
-                if win_len >= 3:
-                    vel = (j_mod_transl[1:] - j_mod_transl[:-1]) * fps
-                    loss_vel = vel.pow(2).mean()
-                    acc = (j_mod_transl[2:] + j_mod_transl[:-2] - 2 * j_mod_transl[1:-1]) * fps
-                    loss_acc = acc.norm(dim=-1).mean()
-                    total_loss = total_loss + self.config['loss_smooth_vel_w'] * loss_vel
-                    total_loss = total_loss + self.config['loss_smooth_acc_w'] * loss_acc
-                    _step_losses['vel'] = loss_vel.item()
-                    _step_losses['acc'] = loss_acc.item()
-
-                # --- Loss 4: Contact constraints ---
-                if self.config['opt_contact'] and contact_conf is not None:
-                    cc = torch.sigmoid(contact_conf[center].to(device))  # (J_contact,)
-                    contact_j = j_center_mod[contact_joint_ids[:len(cc)]]  # (4, 3)
-
-                    # Contact height: 使用动态地面高度代替硬编码 0.08
-                    floor_diff = torch.abs(contact_j[:, 1] - (floor_y + 0.08))
-                    loss_contact_h = (floor_diff * cc[:len(contact_j)]).mean()
-                    total_loss = total_loss + self.config['loss_contact_height_w'] * loss_contact_h
-                    _step_losses['contact_h'] = loss_contact_h.item()
-
-                # --- Loss 5: No joints below floor (使用动态地面高度) ---
-                loss_floor = F.relu(floor_y - j_center_mod[:, 1]).mean()
-                total_loss = total_loss + self.config['loss_floor_w'] * loss_floor
-                _step_losses['floor'] = loss_floor.item()
-
-                # --- Loss 6: Regularization ---
-                loss_reg = delta_t.norm() + delta_orient_aa.norm()
-                total_loss = total_loss + self.config['loss_reg_w'] * loss_reg
-                _step_losses['reg'] = loss_reg.item()
-                _step_losses['total'] = total_loss.item()
-
-                # Debug 日志：每个窗口的第一步和最后一步
-                if step == 0 or step == self.config['opt_steps'] - 1:
-                    self.logger.debug(
-                        f"[OAR Win center={center} step={step}] "
-                        f"reproj={_step_losses.get('reproj', 0):.6f} "
-                        f"depth={_step_losses.get('depth', 0):.6f} "
-                        f"vel={_step_losses.get('vel', 0):.6f} "
-                        f"acc={_step_losses.get('acc', 0):.6f} "
-                        f"contact_h={_step_losses.get('contact_h', 0):.6f} "
-                        f"floor={_step_losses.get('floor', 0):.6f} "
-                        f"reg={_step_losses.get('reg', 0):.6f} "
-                        f"total={_step_losses.get('total', 0):.6f} "
-                        f"delta_t={delta_t.detach().cpu().tolist()}"
-                    )
-
-                total_loss.backward()
-                optimizer.step()
-
-            # 累计最后一步 loss 用于汇总日志
-            for k in _dbg_loss_sums:
-                _dbg_loss_sums[k] += _step_losses.get(k, 0.0)
-            _dbg_count += 1
-
-            # Propagate delta to window
             with torch.no_grad():
-                w = gauss_w[start - center + half_win:end - center + half_win]
-                for j in range(start, end):
-                    local_j = j - start
-                    wt = w[local_j].item()
-                    acc_delta_t[j] += wt * delta_t.detach().cpu()
-                    acc_delta_orient[j] += wt * delta_orient_aa.detach().cpu()
-                    acc_weights[j] += wt
+                out = smplx_model(
+                    global_orient=global_orient_w[global_idx:global_idx+1].to(device),
+                    body_pose=body_pose_aa[local_idx:local_idx+1].to(device),
+                    betas=betas[global_idx:global_idx+1].to(device),
+                    transl=win_transl[local_idx:local_idx+1].to(device),
+                )
+                verts_world = torch.matmul(smplx2smpl, out.vertices[0])
 
-            num_windows += 1
+            verts_cam = torch.einsum('ij,vj->vi', R_w2c_center, verts_world) + t_w2c_center
 
-        # 汇总 loss 日志
-        if _dbg_count > 0:
-            avg_str = " | ".join(
-                f"{k}={v / _dbg_count:.6f}" for k, v in _dbg_loss_sums.items()
-            )
-            self.logger.info(f"[OAR Loss Avg over {_dbg_count} windows (last step)] {avg_str}")
+            color = offset_colors.get(offset, default_color)
+            try:
+                canvas = renderer.render_mesh(verts_cam, canvas, colors=color)
+            except Exception as e:
+                self.logger.warning(f"Render failed for offset {offset}: {e}")
+                continue
 
-        self.logger.info(f"Processed {num_windows} windows")
+        # 标题和图例
+        title = f"Frame {center} | Window [{win_start}:{win_end}] | {tag.upper()}"
+        cv2.putText(canvas, title, (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        y_legend = 50
+        for offset in render_offsets:
+            color = offset_colors.get(offset, default_color)
+            color_bgr = (int(color[2]*255), int(color[1]*255), int(color[0]*255))
+            label = f"offset={offset:+d}"
+            if offset == 0:
+                label += " (center)"
+            cv2.putText(canvas, label, (10, y_legend),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color_bgr, 1)
+            y_legend += 18
 
-        # Normalize by accumulated weights
-        valid = acc_weights > 1e-6
-        acc_delta_t[valid] /= acc_weights[valid].unsqueeze(-1)
-        acc_delta_orient[valid] /= acc_weights[valid].unsqueeze(-1)
-
-        return acc_delta_t, acc_delta_orient
+        out_path = os.path.join(vis_dir, f'{center:05d}.jpg')
+        cv2.imwrite(out_path, canvas)
 
     # ------------------------------------------------------------------
-    # IK correction
+    # IK correction (旋转矩阵空间加权平均)
     # ------------------------------------------------------------------
     def _apply_ik_correction(
         self,
@@ -574,12 +410,119 @@ class DepthSceneRefineComponent(Component):
         global_trans: torch.Tensor,      # (F, 3)
         static_conf_logits: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Run GVHMR process_ik to correct body_pose after root modification."""
+        """旋转矩阵空间加权平均 IK：对静态关节的 local rotation 做帧间 SLERP。
+
+        与原 process_ik（位置空间 rollout merge + CCD IK）不同，
+        直接在旋转矩阵空间做加权平均修改 body_pose：
+        1. FK 得到 local rotation matrix (B, L, 22, 3, 3)
+        2. 对静态关节（脚踝、脚趾、手腕）沿运动链的 local rotation，
+           用 static_conf 在相邻帧之间做加权平均
+        3. 转回 axis-angle 作为修正后的 body_pose
+
+        Returns:
+            corrected body_pose: (F, 63)
+        """
+        from lib.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle
+
+        device = self.device
+        F_total = global_orient_w.shape[0]
+
+        # 构造 static_conf (F, 6) → sigmoid
+        if static_conf_logits is not None:
+            static_conf = torch.sigmoid(static_conf_logits.to(device))  # (F, 6)
+        else:
+            static_conf = torch.zeros(F_total, 6, device=device)
+
+        # FK 获取 local rotation matrices
+        with torch.no_grad():
+            _, local_mat, _ = self.endecoder.fk_v2(
+                body_pose=body_pose_aa.unsqueeze(0).to(device),
+                betas=betas.unsqueeze(0).to(device),
+                global_orient=global_orient_w.unsqueeze(0).to(device),
+                transl=global_trans.unsqueeze(0).to(device),
+                get_intermediate=True,
+            )
+            # local_mat: (1, F, 22, 4, 4), local_rotmat: (1, F, 22, 3, 3)
+
+        local_rotmat = local_mat[0, :, :, :3, :3].clone()  # (F, 22, 3, 3)
+
+        # 静态关节 IDs 和对应的运动链关节
+        # joint_ids = [7, 10, 8, 11, 20, 21]
+        # 对应 static_conf 列: 0=L_Ankle(7), 1=L_Foot(10), 2=R_Ankle(8),
+        #                       3=R_Foot(11), 4=L_Wrist(20), 5=R_Wrist(21)
+        # 修正运动链上的关节（不修 root=0）:
+        chain_map = {
+            0: [1, 4, 7, 10],      # L_Ankle: L_Hip(1)→L_Knee(4)→L_Ankle(7)→L_Foot(10)
+            1: [1, 4, 7, 10],      # L_Foot: 同上
+            2: [2, 5, 8, 11],      # R_Ankle: R_Hip(2)→R_Knee(5)→R_Ankle(8)→R_Foot(11)
+            3: [2, 5, 8, 11],      # R_Foot: 同上
+            4: [13, 16, 18, 20],   # L_Wrist: L_Collar(13)→L_Shoulder(16)→L_Elbow(18)→L_Wrist(20)
+            5: [14, 17, 19, 21],   # R_Wrist: R_Collar(14)→R_Shoulder(17)→R_Elbow(19)→R_Wrist(21)
+        }
+
+        # 旋转矩阵空间 rollout merge:
+        # 对每帧 i，如果 static_conf[i-1, j] 高，则链上关节的 local_rotmat
+        # 趋近前一帧（已平均）的值
+        # R_new[i] = (1 - c) * R_orig[i] + c * R_prev[i-1]
+        # 在旋转矩阵空间做加权平均后 SVD 投影回 SO(3)
+        merged_rotmat = local_rotmat.clone()  # (F, 22, 3, 3)
+
+        for i in range(1, F_total):
+            for conf_idx, chain_joints in chain_map.items():
+                c = static_conf[min(i - 1, static_conf.shape[0] - 1), conf_idx].item()
+                if c < 0.1:
+                    continue
+                for jid in chain_joints:
+                    if jid >= merged_rotmat.shape[1]:
+                        continue
+                    R_prev = merged_rotmat[i - 1, jid]  # (3, 3)
+                    R_curr = local_rotmat[i, jid]         # (3, 3)
+                    # 旋转矩阵加权平均: R_avg = (1-c)*R_curr + c*R_prev，然后 SVD 投影到 SO(3)
+                    R_avg = (1.0 - c) * R_curr + c * R_prev
+                    U, _, Vh = torch.linalg.svd(R_avg)
+                    R_proj = U @ Vh
+                    # 确保 det > 0 (proper rotation)
+                    if torch.det(R_proj) < 0:
+                        U[:, -1] *= -1
+                        R_proj = U @ Vh
+                    merged_rotmat[i, jid] = R_proj
+
+        # 转回 axis-angle: body_pose = joints 1-21 的 local rotation
+        body_rotmat = merged_rotmat[:, 1:, :, :]  # (F, 21, 3, 3)
+        body_aa = matrix_to_axis_angle(body_rotmat)  # (F, 21, 3)
+        corrected_body_pose = body_aa.reshape(F_total, 63).cpu()
+
+        self.logger.debug(
+            f"[RotMat IK] Corrected body_pose for {F_total} frames, "
+            f"delta_norm={((corrected_body_pose - body_pose_aa.cpu()).norm(dim=-1)).mean():.4f}"
+        )
+
+        return corrected_body_pose
+
+    def _apply_pp_static_joint(
+        self,
+        global_orient_w: torch.Tensor,  # (F, 3) aa
+        body_pose_aa: torch.Tensor,      # (F, 63)
+        betas: torch.Tensor,             # (F, 10)
+        global_trans: torch.Tensor,      # (F, 3)
+        static_conf_logits: Optional[torch.Tensor],
+        center_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Run GVHMR pp_static_joint to correct transl (not body_pose).
+
+        Args:
+            center_idx: 窗口中心帧的局部索引。若提供，则以中心帧为锚点对齐，
+                        即保证中心帧 transl 不变，只修正其他帧的相对位移。
+                        若为 None，则保持 pp_static_joint 原始行为（第一帧对齐）。
+
+        Returns:
+            corrected transl: (F, 3)
+        """
         gvhmr_abs = os.path.abspath(self.config['gvhmr_root'])
         if gvhmr_abs not in sys.path:
             sys.path.insert(0, gvhmr_abs)
 
-        from hmr4d.model.gvhmr.utils.postprocess import process_ik
+        from hmr4d.model.gvhmr.utils.postprocess import pp_static_joint
 
         outputs = {
             "pred_smpl_params_global": {
@@ -594,9 +537,503 @@ class DepthSceneRefineComponent(Component):
                 else torch.zeros(1, global_orient_w.shape[0], 6, device=self.device)
             ),
         }
+        post_w_transl = pp_static_joint(outputs, self.endecoder)  # (1, F, 3)
+        result = post_w_transl[0].cpu()
 
-        corrected_body_pose = process_ik(outputs, self.endecoder)  # (1, F, 63)
-        return corrected_body_pose[0].cpu()
+        if center_idx is not None:
+            # pp_static_joint 以第一帧为锚点 cumsum，并做了地面对齐 (y -= min_y)。
+            # 我们希望以中心帧为锚点：计算中心帧的偏移量，整体平移回去。
+            anchor_offset = global_trans[center_idx] - result[center_idx]
+            result = result + anchor_offset
+        else:
+            # 全局调用：只还原 y 轴（地面对齐由下游处理）
+            result[:, 1] = global_trans[:, 1]
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Depth Contact 检测 + Debug 可视化
+    # ------------------------------------------------------------------
+    def _vis_depth_contact_debug(
+        self,
+        center: int,
+        start: int,
+        end: int,
+        global_orient_w: torch.Tensor,   # (F_total, 3) aa
+        body_pose_aa: torch.Tensor,      # (win_len, 63) 窗口 body_pose
+        betas: torch.Tensor,             # (F_total, 10)
+        win_transl: torch.Tensor,        # (win_len, 3) 窗口 transl
+        static_conf_logits: Optional[torch.Tensor],  # (F_total, 6)
+        depth_map: torch.Tensor,         # (H, W) 中心帧深度图
+        R_cw: torch.Tensor,              # (F_total, 3, 3) w2c rotation
+        t_cw: torch.Tensor,              # (F_total, 3) w2c translation
+        K: torch.Tensor,                 # (3, 3) intrinsics
+        image_path: str,                 # 中心帧图片路径
+        output_dir: str,
+    ):
+        """检测窗口内穿透场景的静态接触关节，生成 Contact IK 信号并可视化。
+
+        不依赖 R_cw/t_cw 的绝对精度——仅用于投影到像素。
+        通过窗口内所有关节的 z_scene/z_smpl 中位数做局部 scale 对齐，
+        然后在对齐后的深度空间检测脚部穿透。
+
+        流程：
+        1. FK → 世界关节 → 中心帧相机坐标 → 像素 (u,v) + z_smpl
+        2. 用中心帧所有 22 个关节计算 scale_factor = median(z_scene / z_smpl)
+        3. z_smpl_aligned = z_smpl * scale_factor
+        4. 对静态脚部关节：若 z_smpl_aligned > z_scene + eps → 穿透
+        5. 可视化 + 返回 contact_info_list 作为 IK 信号
+
+        颜色编码：
+        - 蓝色小点：用于 scale 对齐的中心帧所有关节
+        - 绿色圆圈：静态脚部、对齐后未穿透
+        - 红色圆圈 + 箭头：对齐后仍穿透，需要 Contact IK
+        """
+        import cv2
+
+        vis_dir = os.path.join(output_dir, 'oar_depth_contact_debug')
+        os.makedirs(vis_dir, exist_ok=True)
+
+        device = self.device
+        win_len = end - start
+        center_local = center - start
+
+        # static_conf 列索引 → FK-22 关节 ID
+        CONTACT_JOINTS = {
+            0: (7,  'L_Ankle'),
+            1: (10, 'L_Foot'),
+            2: (8,  'R_Ankle'),
+            3: (11, 'R_Foot'),
+        }
+        PENETRATION_EPS = 0.03  # 3cm 穿透阈值（对齐后用更小阈值）
+
+        # 构造 static_conf (win_len, 6)
+        if static_conf_logits is not None:
+            win_static = static_conf_logits[start:end].to(device)
+            static_conf = torch.sigmoid(win_static)  # (win_len, 6)
+        else:
+            static_conf = torch.zeros(win_len, 6, device=device)
+
+        # FK 计算窗口内关节的世界坐标系位置
+        win_orient = global_orient_w[start:end].to(device)
+        win_betas = betas[start:end].to(device)
+        win_bp = body_pose_aa.to(device)
+        win_tr = win_transl.to(device)
+
+        with torch.no_grad():
+            joints_world = self.endecoder.fk_v2(
+                body_pose=win_bp.unsqueeze(0),
+                betas=win_betas.unsqueeze(0),
+                global_orient=win_orient.unsqueeze(0),
+                transl=win_tr.unsqueeze(0),
+            )[0]  # (win_len, 22, 3)
+
+        R_center = R_cw[center].to(device)  # (3, 3)
+        t_center = t_cw[center].to(device)  # (3,)
+        K_dev = K.to(device)
+        depth_dev = depth_map.to(device)
+        dH, dW = depth_dev.shape
+
+        img = cv2.imread(image_path)
+        if img is None:
+            self.logger.warning(f"Cannot read image: {image_path}")
+            return
+        H, W = img.shape[:2]
+        canvas = img.copy()
+
+        # ================================================================
+        # Phase 1: 用中心帧所有 22 个关节计算局部 scale_factor
+        # ================================================================
+        z_smpl_all = []
+        z_scene_all = []
+        center_joint_pixels = []  # 用于可视化 scale 对齐的采样点
+
+        j_center_world = joints_world[center_local]  # (22, 3)
+        j_center_cam = (R_center @ j_center_world.T).T + t_center  # (22, 3)
+        pj_center = (K_dev @ j_center_cam.T).T  # (22, 3)
+        pj_center_2d = pj_center[:, :2] / (pj_center[:, 2:3] + 1e-6)  # (22, 2)
+
+        for jid in range(22):
+            z_s = j_center_cam[jid, 2].item()
+            if z_s <= 0.01:
+                continue
+            u_px = int(round(pj_center_2d[jid, 0].item()))
+            v_px = int(round(pj_center_2d[jid, 1].item()))
+            if u_px < 0 or u_px >= dW or v_px < 0 or v_px >= dH:
+                continue
+            z_d = depth_dev[v_px, u_px].item()
+            if z_d < 0.1 or z_d > 100.0:
+                continue
+            z_smpl_all.append(z_s)
+            z_scene_all.append(z_d)
+            center_joint_pixels.append((u_px, v_px, jid, z_s, z_d))
+
+        if len(z_smpl_all) < 3:
+            self.logger.warning(f"Window {center}: too few valid joints for scale alignment ({len(z_smpl_all)})")
+            return
+
+        z_smpl_arr = np.array(z_smpl_all)
+        z_scene_arr = np.array(z_scene_all)
+        ratios = z_scene_arr / (z_smpl_arr + 1e-8)
+        scale_factor = float(np.median(ratios))
+
+        self.logger.debug(
+            f"[DepthContact] Window {center}: scale_factor={scale_factor:.4f} "
+            f"(median of {len(ratios)} joints, range=[{ratios.min():.3f}, {ratios.max():.3f}])"
+        )
+
+        # 在画布上画 scale 对齐采样点（蓝色小点）
+        for u_px, v_px, jid, zs, zd in center_joint_pixels:
+            if 0 <= u_px < W and 0 <= v_px < H:
+                cv2.circle(canvas, (u_px, v_px), 2, (255, 150, 0), -1)
+
+        # ================================================================
+        # Phase 2: 对齐后检测脚部静态关节穿透
+        # ================================================================
+        n_static = 0
+        n_penetrate = 0
+        contact_info_list = []
+
+        for fi in range(win_len):
+            frame_global = start + fi
+            for conf_idx, (jid, jname) in CONTACT_JOINTS.items():
+                conf_val = static_conf[fi, conf_idx].item()
+                if conf_val < 0.5:
+                    continue
+
+                n_static += 1
+
+                j_world = joints_world[fi, jid]
+                j_cam = R_center @ j_world + t_center
+                z_smpl_raw = j_cam[2].item()
+                z_smpl_aligned = z_smpl_raw * scale_factor
+
+                pj = K_dev @ j_cam
+                u = pj[0].item() / (pj[2].item() + 1e-6)
+                v = pj[1].item() / (pj[2].item() + 1e-6)
+                ui, vi = int(round(u)), int(round(v))
+
+                if ui < 0 or ui >= dW or vi < 0 or vi >= dH:
+                    continue
+                if ui < 0 or ui >= W or vi < 0 or vi >= H:
+                    continue
+
+                z_scene = depth_dev[vi, ui].item()
+                if z_scene < 0.1 or z_scene > 100.0:
+                    continue
+
+                penetration = z_smpl_aligned - z_scene - PENETRATION_EPS
+                is_penetrating = penetration > 0
+
+                if is_penetrating:
+                    n_penetrate += 1
+
+                contact_info_list.append({
+                    'frame': frame_global,
+                    'fi': fi,
+                    'jid': jid,
+                    'jname': jname,
+                    'conf': conf_val,
+                    'u': ui, 'v': vi,
+                    'z_smpl_raw': z_smpl_raw,
+                    'z_smpl_aligned': z_smpl_aligned,
+                    'z_scene': z_scene,
+                    'penetration': penetration if is_penetrating else 0.0,
+                    'is_penetrating': is_penetrating,
+                })
+
+        # ---- 绘制接触点 ----
+        for info in contact_info_list:
+            u, v = info['u'], info['v']
+            if info['is_penetrating']:
+                radius = max(5, min(14, int(info['penetration'] * 200)))
+                cv2.circle(canvas, (u, v), radius, (0, 0, 255), 2)
+                arrow_len = max(12, min(50, int(info['penetration'] * 400)))
+                cv2.arrowedLine(canvas, (u, v), (u, v - arrow_len),
+                                (0, 0, 255), 2, tipLength=0.3)
+                label = f"{info['jname']}@f{info['frame']} pen={info['penetration']:.3f}m"
+                cv2.putText(canvas, label, (u + 5, v - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 0, 255), 1)
+            else:
+                cv2.circle(canvas, (u, v), 3, (0, 200, 0), -1)
+                label = f"{info['jname']}@f{info['frame']}"
+                cv2.putText(canvas, label, (u + 3, v - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.22, (0, 200, 0), 1)
+
+        # ---- 图例和统计 ----
+        cv2.putText(canvas,
+                    f"Window center={center} | scale={scale_factor:.3f} | "
+                    f"Static: {n_static} | Penetrating: {n_penetrate}",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+        cv2.putText(canvas,
+                    "Blue=scale_ref  Green=static(OK)  Red+arrow=penetrating(contact IK)",
+                    (10, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+
+        if contact_info_list:
+            pen_items = [c for c in contact_info_list if c['is_penetrating']]
+            if pen_items:
+                y_offset = 50
+                cv2.putText(canvas, f"Penetration Summary (scale={scale_factor:.3f}):",
+                            (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 150, 255), 1)
+                y_offset += 18
+                for item in pen_items[:15]:
+                    txt = (f"  f{item['frame']} {item['jname']}: "
+                           f"z_raw={item['z_smpl_raw']:.2f} z_align={item['z_smpl_aligned']:.2f} "
+                           f"z_scene={item['z_scene']:.2f} pen={item['penetration']:.3f}m")
+                    cv2.putText(canvas, txt, (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 150, 255), 1)
+                    y_offset += 14
+                if len(pen_items) > 15:
+                    cv2.putText(canvas, f"  ... and {len(pen_items) - 15} more",
+                                (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.28, (0, 150, 255), 1)
+
+        out_path = os.path.join(vis_dir, f'{center:05d}.jpg')
+        cv2.imwrite(out_path, canvas)
+
+        if n_penetrate > 0:
+            self.logger.debug(
+                f"[DepthContact] Window {center}: scale={scale_factor:.3f}, "
+                f"{n_static} static, {n_penetrate} penetrating"
+            )
+
+        return contact_info_list
+
+    # ------------------------------------------------------------------
+    # Depth Contact IK: 基于深度图穿透信号优化 body_pose
+    # ------------------------------------------------------------------
+    def _apply_depth_contact_ik(
+        self,
+        global_orient_w: torch.Tensor,   # (F_total, 3) aa
+        body_pose_aa: torch.Tensor,      # (win_len, 63) 窗口 body_pose
+        betas: torch.Tensor,             # (F_total, 10)
+        win_transl: torch.Tensor,        # (win_len, 3) 窗口 transl
+        static_conf_logits: Optional[torch.Tensor],  # (F_total, 6)
+        depth_map: torch.Tensor,         # (H, W) 中心帧深度图
+        R_cw: torch.Tensor,              # (F_total, 3, 3)
+        t_cw: torch.Tensor,              # (F_total, 3)
+        K: torch.Tensor,                 # (3, 3)
+        center: int,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        """基于深度图的 Contact IK：优化窗口内 body_pose 使穿透接触关节对齐场景表面。
+
+        流程：
+        1. 用中心帧所有 22 个关节计算局部 scale_factor = median(z_scene / z_smpl)
+        2. 对窗口内每帧的静态脚部关节，计算 scale-aligned 后的目标 3D 位置
+           （从深度图反投影得到相机坐标系下目标点，再转回世界坐标系）
+        3. Adam 优化 delta_body_pose（只修改腿部运动链），使 FK 后关节到达目标位置
+        4. 同时加入时序平滑正则 + body_pose 正则
+
+        只修改腿部运动链：L_Hip(1)→L_Knee(4)→L_Ankle(7)→L_Foot(10)
+                          R_Hip(2)→R_Knee(5)→R_Ankle(8)→R_Foot(11)
+
+        Returns:
+            refined body_pose: (win_len, 63)
+        """
+        device = self.device
+        win_len = end - start
+        center_local = center - start
+
+        # --- 配置 ---
+        opt_steps = self.config.get('contact_ik_steps', 30)
+        lr = self.config.get('contact_ik_lr', 0.003)
+        loss_contact_w = self.config.get('loss_contact_w', 5.0)
+        loss_contact_sigma = self.config.get('loss_contact_sigma', 0.05)
+        loss_bp_reg_w = self.config.get('loss_contact_bp_reg_w', 0.1)
+        loss_smooth_w = self.config.get('loss_contact_smooth_w', 0.5)
+        pen_eps = 0.03  # 3cm 穿透阈值
+
+        # --- static_conf ---
+        CONTACT_JOINTS = {
+            0: 7,   # L_Ankle
+            1: 10,  # L_Foot
+            2: 8,   # R_Ankle
+            3: 11,  # R_Foot
+        }
+        # 腿部运动链关节 (body_pose 索引)
+        LEG_JOINTS = [1, 2, 4, 5, 7, 8, 10, 11]
+        leg_bp_indices = []
+        for j in LEG_JOINTS:
+            leg_bp_indices.extend([(j-1)*3, (j-1)*3+1, (j-1)*3+2])
+
+        if static_conf_logits is not None:
+            static_conf = torch.sigmoid(static_conf_logits[start:end].to(device))
+        else:
+            static_conf = torch.zeros(win_len, 6, device=device)
+
+        # --- FK 计算当前关节位置 ---
+        win_orient = global_orient_w[start:end].to(device)
+        win_betas = betas[start:end].to(device)
+        win_bp = body_pose_aa.to(device)
+        win_tr = win_transl.to(device)
+
+        R_center = R_cw[center].to(device)
+        t_center = t_cw[center].to(device)
+        K_dev = K.to(device)
+        K_inv = torch.inverse(K_dev)
+        depth_dev = depth_map.to(device)
+        dH, dW = depth_dev.shape
+
+        # --- Phase 1: 计算局部 scale_factor ---
+        with torch.no_grad():
+            joints_world_init = self.endecoder.fk_v2(
+                body_pose=win_bp.unsqueeze(0),
+                betas=win_betas.unsqueeze(0),
+                global_orient=win_orient.unsqueeze(0),
+                transl=win_tr.unsqueeze(0),
+            )[0]  # (win_len, 22, 3)
+
+        j_center_world = joints_world_init[center_local]  # (22, 3)
+        j_center_cam = (R_center @ j_center_world.T).T + t_center  # (22, 3)
+        pj_center = (K_dev @ j_center_cam.T).T
+        pj_center_2d = pj_center[:, :2] / (pj_center[:, 2:3] + 1e-6)
+
+        z_smpl_list, z_scene_list = [], []
+        for jid in range(22):
+            z_s = j_center_cam[jid, 2].item()
+            if z_s <= 0.01:
+                continue
+            u_px = int(round(pj_center_2d[jid, 0].item()))
+            v_px = int(round(pj_center_2d[jid, 1].item()))
+            if u_px < 0 or u_px >= dW or v_px < 0 or v_px >= dH:
+                continue
+            z_d = depth_dev[v_px, u_px].item()
+            if z_d < 0.1 or z_d > 100.0:
+                continue
+            z_smpl_list.append(z_s)
+            z_scene_list.append(z_d)
+
+        if len(z_smpl_list) < 3:
+            self.logger.debug(f"[ContactIK] Window {center}: too few joints for scale, skipping")
+            return body_pose_aa
+
+        scale_factor = float(np.median(np.array(z_scene_list) / (np.array(z_smpl_list) + 1e-8)))
+
+        # --- Phase 2: 为每帧每个穿透的静态脚部关节计算目标世界坐标 ---
+        # contact_targets[fi][jid] = target_world_pos (3,)
+        contact_targets = {}  # {fi: {jid: (3,) tensor}}
+        n_targets = 0
+
+        for fi in range(win_len):
+            for conf_idx, jid in CONTACT_JOINTS.items():
+                conf_val = static_conf[fi, conf_idx].item()
+                if conf_val < 0.5:
+                    continue
+
+                j_world = joints_world_init[fi, jid]
+                j_cam = R_center @ j_world + t_center
+                z_smpl_aligned = j_cam[2].item() * scale_factor
+
+                pj = K_dev @ j_cam
+                u = pj[0].item() / (pj[2].item() + 1e-6)
+                v = pj[1].item() / (pj[2].item() + 1e-6)
+                ui, vi = int(round(u)), int(round(v))
+
+                if ui < 0 or ui >= dW or vi < 0 or vi >= dH:
+                    continue
+
+                z_scene = depth_dev[vi, ui].item()
+                if z_scene < 0.1 or z_scene > 100.0:
+                    continue
+
+                penetration = z_smpl_aligned - z_scene - pen_eps
+                if penetration <= 0:
+                    continue  # 没穿透，不需要修正
+
+                # 用深度图反投影得到目标相机坐标系 3D 位置
+                # p_target_cam = z_scene * K^{-1} @ [u, v, 1]^T
+                # 但注意 z_scene 是 metric depth，而我们的相机坐标系有 scale 偏差
+                # 所以目标深度应该是 z_scene / scale_factor（转回 SMPL 的 scale 空间）
+                z_target_smpl_scale = z_scene / scale_factor
+                pixel_homo = torch.tensor([u, v, 1.0], device=device)
+                p_target_cam = z_target_smpl_scale * (K_inv @ pixel_homo)  # (3,)
+
+                # 转回世界坐标系：p_world = R_center^T @ (p_cam - t_center)
+                p_target_world = R_center.T @ (p_target_cam - t_center)
+
+                contact_targets.setdefault(fi, {})[jid] = p_target_world.detach()
+                n_targets += 1
+
+        if n_targets == 0:
+            self.logger.debug(f"[ContactIK] Window {center}: no penetrating contacts, skipping")
+            return body_pose_aa
+
+        self.logger.debug(
+            f"[ContactIK] Window {center}: {n_targets} targets, "
+            f"scale={scale_factor:.3f}, optimizing {opt_steps} steps"
+        )
+
+        # --- Phase 3: Adam 优化 delta_body_pose ---
+        bp_orig = win_bp.clone().detach()
+        delta_bp = torch.zeros(win_len, len(leg_bp_indices), device=device, requires_grad=True)
+        optimizer = torch.optim.Adam([delta_bp], lr=lr)
+
+        for step in range(opt_steps):
+            optimizer.zero_grad()
+
+            bp_mod = bp_orig.clone()
+            bp_mod[:, leg_bp_indices] = bp_orig[:, leg_bp_indices] + delta_bp
+
+            # 全局 FK（带 global_orient 和 transl）
+            with torch.enable_grad():
+                joints_world_opt = self.endecoder.fk_v2(
+                    body_pose=bp_mod.unsqueeze(0),
+                    betas=win_betas.unsqueeze(0),
+                    global_orient=win_orient.unsqueeze(0),
+                    transl=win_tr.unsqueeze(0),
+                )[0]  # (win_len, 22, 3)
+
+            # Loss 1: 接触关节到目标位置的距离
+            loss_contact = torch.tensor(0.0, device=device)
+            cnt = 0
+            for fi, targets in contact_targets.items():
+                for jid, target_pos in targets.items():
+                    diff = joints_world_opt[fi, jid] - target_pos
+                    loss_contact = loss_contact + gmof(diff, sigma=loss_contact_sigma).sum()
+                    cnt += 1
+            if cnt > 0:
+                loss_contact = loss_contact / cnt
+
+            # Loss 2: body_pose 正则化（不偏离原始太多）
+            loss_reg = delta_bp.pow(2).mean()
+
+            # Loss 3: 时序平滑（相邻帧的 delta 应该相近）
+            loss_smooth = torch.tensor(0.0, device=device)
+            if win_len >= 2:
+                delta_diff = delta_bp[1:] - delta_bp[:-1]
+                loss_smooth = delta_diff.pow(2).mean()
+
+            total_loss = (
+                loss_contact_w * loss_contact
+                + loss_bp_reg_w * loss_reg
+                + loss_smooth_w * loss_smooth
+            )
+
+            total_loss.backward()
+            optimizer.step()
+
+            if step == 0 or step == opt_steps - 1:
+                self.logger.debug(
+                    f"[ContactIK step={step}] "
+                    f"contact={loss_contact.item():.6f}, "
+                    f"reg={loss_reg.item():.6f}, "
+                    f"smooth={loss_smooth.item():.6f}, "
+                    f"total={total_loss.item():.6f}"
+                )
+
+        # --- Phase 4: 应用修正 ---
+        with torch.no_grad():
+            refined_bp = bp_orig.clone()
+            refined_bp[:, leg_bp_indices] = bp_orig[:, leg_bp_indices] + delta_bp.detach()
+
+        delta_norm = delta_bp.detach().abs().mean().item()
+        self.logger.debug(
+            f"[ContactIK] Window {center}: done, "
+            f"delta_bp_mean={delta_norm:.6f}, {n_targets} targets"
+        )
+
+        return refined_bp.cpu()
 
     # ------------------------------------------------------------------
     # 图像模型 3D body pose 纠正
@@ -755,131 +1192,6 @@ class DepthSceneRefineComponent(Component):
         """投影所有帧的世界关节到 2D，返回 (F, J, 2)。"""
         pj_2d, _ = self._project_joints(joints_world, R_cw, t_cw, K)
         return pj_2d  # (F, J, 2)
-
-    def _vis_depth_maps(
-        self,
-        depth_maps: Dict[int, torch.Tensor],
-        image_paths: List[str],
-        joints_cam: torch.Tensor,       # (F, J, 3) camera-space joints
-        proj_2d: torch.Tensor,           # (F, J, 2) projected 2D joints
-        output_dir: str,
-        kp2d: torch.Tensor = None,      # (F, 17, 3) ViTPose COCO-17 x,y,conf (optional, for debug)
-    ):
-        """可视化深度图：彩色深度图叠加到原图 + 关节深度标注。
-
-        对每个有深度图的帧，生成左右拼接图：
-          左：原图 + 关节投影点（颜色编码关节深度）
-          右：彩色深度图 + 关节投影点（标注 SMPL 关节深度 vs 场景深度）
-        """
-        import cv2
-        from matplotlib.colors import Normalize
-        import matplotlib.cm as cm
-
-        vis_dir = os.path.join(output_dir, 'oar_depth')
-        os.makedirs(vis_dir, exist_ok=True)
-
-        # 深度 colormap
-        all_depths = torch.cat([d.flatten() for d in depth_maps.values()])
-        valid_depths = all_depths[(all_depths > 0.1) & (all_depths < 100.0)]
-        if len(valid_depths) == 0:
-            self.logger.warning("No valid depth values for visualization")
-            return
-        # quantile() has a limit on tensor size (~2^24 elements).
-        # Subsample if too large to avoid "input tensor is too large" error.
-        if valid_depths.numel() > 10_000_000:
-            indices = torch.randperm(valid_depths.numel())[:10_000_000]
-            sampled = valid_depths[indices]
-        else:
-            sampled = valid_depths
-        d_min, d_max = valid_depths.min().item(), sampled.quantile(0.95).item()
-
-        for fidx, depth_t in depth_maps.items():
-            if fidx >= len(image_paths):
-                continue
-            img = cv2.imread(image_paths[fidx])
-            if img is None:
-                continue
-            H, W = img.shape[:2]
-            depth_np = depth_t.numpy()
-            dH, dW = depth_np.shape
-
-            # 生成彩色深度图
-            depth_norm = np.clip((depth_np - d_min) / (d_max - d_min + 1e-6), 0, 1)
-            depth_color = (cm.get_cmap('plasma')(depth_norm)[:, :, :3] * 255).astype(np.uint8)
-            depth_color = cv2.cvtColor(depth_color, cv2.COLOR_RGB2BGR)
-
-            # 将深度图 resize 到图像尺寸
-            if (dH, dW) != (H, W):
-                depth_color = cv2.resize(depth_color, (W, H), interpolation=cv2.INTER_LINEAR)
-                depth_np_resized = cv2.resize(depth_np, (W, H), interpolation=cv2.INTER_LINEAR)
-            else:
-                depth_np_resized = depth_np
-
-            # 叠加深度到原图（半透明）
-            depth_overlay = cv2.addWeighted(img, 0.5, depth_color, 0.5, 0)
-
-            # 在两张图上标注关节
-            n_joints = proj_2d.shape[1]
-            for j in range(n_joints):
-                u, v = int(proj_2d[fidx, j, 0].item()), int(proj_2d[fidx, j, 1].item())
-                if 0 <= u < W and 0 <= v < H:
-                    z_smpl = joints_cam[fidx, j, 2].item()
-                    z_scene = depth_np_resized[min(v, H-1), min(u, W-1)]
-
-                    # 颜色：穿透（红）、正常（绿）、无效深度（灰）
-                    if z_scene < 0.1 or z_scene > 100.0:
-                        color = (128, 128, 128)
-                    elif z_smpl > z_scene + 0.05:
-                        color = (0, 0, 255)  # 穿透 - 红
-                    else:
-                        color = (0, 255, 0)  # 正常 - 绿
-
-                    cv2.circle(depth_overlay, (u, v), 4, color, -1)
-                    cv2.circle(depth_color, (u, v), 4, color, -1)
-
-                    # 标注深度差值（仅对有效深度）
-                    if 0.1 < z_scene < 100.0:
-                        diff = z_smpl - z_scene
-                        label = f"{diff:+.2f}"
-                        cv2.putText(depth_color, label, (u + 6, v - 4),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
-
-            # [Debug] 画 ViTPose 2D 检测点（青色）
-            if kp2d is not None and fidx < kp2d.shape[0]:
-                kp = kp2d[fidx]  # (17, 3): x, y, conf
-                COCO_SKELETON = [
-                    (0, 1), (0, 2), (1, 3), (2, 4),
-                    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
-                    (5, 11), (6, 12), (11, 12),
-                    (11, 13), (13, 15), (12, 14), (14, 16),
-                ]
-                # 画 skeleton 连线（青色）
-                for i, j_idx in COCO_SKELETON:
-                    if kp[i, 2] > 0.3 and kp[j_idx, 2] > 0.3:
-                        pt1 = (int(kp[i, 0].item()), int(kp[i, 1].item()))
-                        pt2 = (int(kp[j_idx, 0].item()), int(kp[j_idx, 1].item()))
-                        cv2.line(depth_overlay, pt1, pt2, (255, 255, 0), 1)
-                        cv2.line(depth_color, pt1, pt2, (255, 255, 0), 1)
-                # 画关键点（青色空心圆）
-                for ki in range(kp.shape[0]):
-                    if kp[ki, 2] > 0.3:
-                        pt = (int(kp[ki, 0].item()), int(kp[ki, 1].item()))
-                        cv2.circle(depth_overlay, pt, 5, (255, 255, 0), 1)
-                        cv2.circle(depth_color, pt, 5, (255, 255, 0), 1)
-
-            # 拼接
-            combined = np.concatenate([depth_overlay, depth_color], axis=1)
-
-            # 标题
-            cv2.putText(combined, f"Frame {fidx} | Depth Overlay", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(combined, "Depth Map + Joint Z diff", (W + 10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-            out_path = os.path.join(vis_dir, f'{fidx:05d}.jpg')
-            cv2.imwrite(out_path, combined)
-
-        self.logger.info(f"Saved depth visualizations ({len(depth_maps)} frames) to {vis_dir}")
 
     def _vis_keypoints_2d(
         self,
@@ -1092,7 +1404,7 @@ class DepthSceneRefineComponent(Component):
             combined = np.concatenate([canvas_pre, canvas_post], axis=1)
             out_path = os.path.join(vis_dir, f'{fidx:05d}.jpg')
             cv2.imwrite(out_path, combined)
-            print("saving:", out_path) 
+            #print("saving:", out_path) 
         # 全局统计日志
         if all_err_pre:
             self.logger.info(
@@ -1255,9 +1567,143 @@ class DepthSceneRefineComponent(Component):
         self.logger.info(f"Saved OAR comparison visualisation to {vis_dir}")
 
     # ------------------------------------------------------------------
+    # Window-level optimization (single window)
+    # ------------------------------------------------------------------
+    def _optimize_single_window(
+        self,
+        center: int,
+        start: int,
+        end: int,
+        joints_world: torch.Tensor,  # (F, J, 3)
+        R_cw: torch.Tensor,
+        t_cw: torch.Tensor,
+        K: torch.Tensor,
+        kp2d: Optional[torch.Tensor],
+        depth_map: Optional[torch.Tensor],  # (H, W) 中心帧的单张深度图，或 None
+        img_h: int,
+        img_w: int,
+    ) -> torch.Tensor:
+        """对单个窗口做 depth + 2D KP refine，返回中心帧的 delta_t (3,)。
+
+        深度约束直接在相机坐标系下比较：
+        - SMPL 关节 w2c 投影得到 z_smpl
+        - 深度图在关节投影像素位置采样得到 z_scene
+        - 只修正 transl（本质是深度 scale 对齐）
+        """
+        device = self.device
+        fps = self.config['fps']
+        win_len = end - start
+        center_local = center - start
+
+        j_win = joints_world[start:end].to(device)
+        R_win = R_cw[start:end].to(device)
+        t_win = t_cw[start:end].to(device)
+
+        from lib.utils.rotation_conversions import axis_angle_to_matrix
+
+        delta_t = torch.zeros(3, device=device, requires_grad=True)
+
+        if self.config['enable_orient_refine']:
+            delta_orient_aa = torch.zeros(3, device=device, requires_grad=True)
+            opt_params = [delta_t, delta_orient_aa]
+        else:
+            delta_orient_aa = torch.zeros(3, device=device)
+            opt_params = [delta_t]
+
+        optimizer = torch.optim.Adam(opt_params, lr=self.config['opt_lr'])
+
+        # FK→COCO mapping
+        n_joints = joints_world.shape[1]
+        _FK_TO_COCO_PAIRS = [
+            (1, 11), (2, 12), (4, 13), (5, 14), (7, 15), (8, 16),
+            (16, 5), (17, 6), (18, 7), (19, 8), (20, 9), (21, 10),
+        ]
+        fk_coco_pairs = [(fk, coco) for fk, coco in _FK_TO_COCO_PAIRS if fk < n_joints]
+        fk_pair_idxs = [p[0] for p in fk_coco_pairs]
+        coco_pair_idxs = [p[1] for p in fk_coco_pairs]
+
+        # Gaussian weights for smoothness
+        half_win = self.config['window_size'] // 2
+        sigma = self.config['sigma']
+        offsets = torch.arange(-half_win, half_win + 1).float()
+        gauss_w = torch.exp(-offsets ** 2 / (2 * sigma ** 2))
+        gauss_w = gauss_w / gauss_w.max()
+
+        K_dev = K.to(device)
+
+        # 预处理深度图
+        depth_dev = None
+        if depth_map is not None and self.config['enable_depth_constraint']:
+            depth_dev = depth_map.to(device)
+
+        for step in range(self.config['opt_steps']):
+            optimizer.zero_grad()
+
+            delta_R = axis_angle_to_matrix(delta_orient_aa.unsqueeze(0))
+            j_center_mod = (delta_R @ j_win[center_local].unsqueeze(-1)).squeeze(-1) + delta_t
+
+            j_cam_center = (R_win[center_local] @ j_center_mod.unsqueeze(-1)).squeeze(-1) + t_win[center_local]
+            pj = (K_dev @ j_cam_center.unsqueeze(-1)).squeeze(-1)
+            pj_2d = pj[:, :2] / (pj[:, 2:3] + 1e-6)
+
+            total_loss = torch.tensor(0.0, device=device)
+
+            # Loss 1: 2D reprojection
+            if kp2d is not None and len(fk_coco_pairs) > 0:
+                kp_center = kp2d[center].to(device)
+                gt_2d = kp_center[coco_pair_idxs, :2]
+                conf = kp_center[coco_pair_idxs, 2]
+                proj_2d = pj_2d[fk_pair_idxs]
+                reproj_err = gmof(proj_2d - gt_2d, sigma=self.config['reproj_sigma'])
+                reproj_err = reproj_err / 1000.0
+                conf_mask = conf > 0.5
+                loss_reproj = (conf_mask.unsqueeze(-1) * reproj_err).mean()
+                total_loss = total_loss + self.config['loss_reproj_w'] * loss_reproj
+
+            # Loss 2: Depth alignment (相机坐标系 z_smpl vs z_scene)
+            if depth_dev is not None:
+                dH, dW = depth_dev.shape
+                u = pj_2d[:, 0].long().clamp(0, dW - 1)
+                v = pj_2d[:, 1].long().clamp(0, dH - 1)
+                z_smpl = j_cam_center[:, 2]
+                z_scene = depth_dev[v, u]
+                valid_depth = (z_scene > 0.1) & (z_scene < 100.0) & (z_smpl > 0)
+                penetration = F.relu(z_smpl - z_scene - 0.05)
+                if valid_depth.any():
+                    loss_depth = gmof(penetration[valid_depth], sigma=self.config['depth_sigma']).mean()
+                else:
+                    loss_depth = torch.tensor(0.0, device=device)
+                total_loss = total_loss + self.config['loss_depth_w'] * loss_depth
+
+            # Loss 3: Smoothness
+            t_weights = gauss_w[start - center + half_win:end - center + half_win].to(device)
+            delta_t_propagated = t_weights.unsqueeze(-1) * delta_t.unsqueeze(0)
+            j_mod_transl = j_win[:, 0, :] + delta_t_propagated
+            if win_len >= 3:
+                vel = (j_mod_transl[1:] - j_mod_transl[:-1]) * fps
+                loss_vel = vel.pow(2).mean()
+                acc = (j_mod_transl[2:] + j_mod_transl[:-2] - 2 * j_mod_transl[1:-1]) * fps
+                loss_acc = acc.norm(dim=-1).mean()
+                total_loss = total_loss + self.config['loss_smooth_vel_w'] * loss_vel
+                total_loss = total_loss + self.config['loss_smooth_acc_w'] * loss_acc
+
+            # Loss 4: Regularization
+            loss_reg = delta_t.norm() + delta_orient_aa.norm()
+            total_loss = total_loss + self.config['loss_reg_w'] * loss_reg
+
+            total_loss.backward()
+            optimizer.step()
+
+        return delta_t.detach().cpu()
+
+    # ------------------------------------------------------------------
     # Main execute
     # ------------------------------------------------------------------
     def execute(self, data: PipelineData) -> PipelineData:
+        """窗口级独立 Pipeline：每个窗口独立创建 transl 副本，
+        渲染 pre → depth+2DKP refine → IK → 渲染 post。
+        同时仍将全局修正（高斯合并）写回 data.smpl_params 供 eval 使用。
+        """
         sp = data.smpl_params
         cam = data.camera_params
 
@@ -1289,7 +1735,11 @@ class DepthSceneRefineComponent(Component):
         static_conf_logits = _to_tensor(sp.static_conf_logits)
 
         F_total = global_orient_w.shape[0]
-        self.logger.info(f"OAR: {F_total} frames, window={self.config['window_size']}, stride={self.config['stride']}")
+        window_size = self.config['window_size']
+        stride = self.config['stride']
+        sigma = self.config['sigma']
+        half_win = window_size // 2
+        self.logger.info(f"OAR: {F_total} frames, window={window_size}, stride={stride}")
 
         # --- 1. Get camera w2c ---
         wt = data.metadata.get('world_transform', {})
@@ -1297,10 +1747,8 @@ class DepthSceneRefineComponent(Component):
         T_wc = _to_tensor(wt.get('T_wc', cam.world_T if cam.world_T is not None else cam.T))
         R_cw, t_cw = self._build_w2c(R_wc, T_wc)
 
-        # 优先使用 HPE 推理时用的 K（estimate_K），而非 GT K。
-        # 因为 global_orient_w / global_trans 是基于 estimate_K 推理的 incam 参数转换而来，
-        # 投影时必须用相同的 K 才能正确对齐到图像。
-        K_gt = _to_tensor(cam.intrinsics)  # GT K（可能来自 SLAM/annotations）
+        # K selection (HPE K for projection, GT K for depth)
+        K_gt = _to_tensor(cam.intrinsics)
         hpe_K = data.metadata.get('hpe_K', None)
         if hpe_K is not None:
             K = _to_tensor(hpe_K)
@@ -1312,10 +1760,9 @@ class DepthSceneRefineComponent(Component):
             else:
                 self.logger.info(f"Using HPE estimate_K: fx={float(K[0,0]):.1f}")
         else:
-            # hpe_K 不在 metadata 中（可能是旧缓存），用 estimate_K 方式重新计算
             img0 = np.array(Image.open(data.image_paths[0]))
             H, W = img0.shape[:2]
-            f_est = (H**2 + W**2) ** 0.5  # 与 PromptHMR estimate_K 一致
+            f_est = (H**2 + W**2) ** 0.5
             K = torch.tensor([[f_est, 0, W/2.], [0, f_est, H/2.], [0, 0, 1]], dtype=torch.float)
             if K_gt is not None:
                 self.logger.info(
@@ -1324,206 +1771,303 @@ class DepthSceneRefineComponent(Component):
                 )
             else:
                 self.logger.info(f"Using computed estimate_K: fx={f_est:.1f}")
-
-        # 深度推理仍使用 GT K（Metric3D 需要真实内参来恢复度量深度）
         K_for_depth = K_gt if K_gt is not None else K
 
-        # --- 2. Generate depth maps for sampled frames ---
-        depth_stride = self.config['depth_frame_stride']
-        depth_frame_indices = np.arange(0, F_total, depth_stride)
-        depth_maps = {}
+        # --- 2. 加载 Metric3D（窗口循环内按需推理，循环后卸载） ---
+        intrinsics_np = K_for_depth.numpy() if isinstance(K_for_depth, torch.Tensor) else K_for_depth
         if self.config['enable_depth_constraint']:
-            intrinsics_np = K_for_depth.numpy() if isinstance(K_for_depth, torch.Tensor) else K_for_depth
-            save_dir = None
-            if self.config['save_depth_maps']:
-                output_dir = data.metadata.get('output_dir', 'results/oar_debug')
-                save_dir = os.path.join(output_dir, data.sequence_name, 'depth_maps')
-            depth_maps = self._infer_depth_maps(
-                data.image_paths, depth_frame_indices, intrinsics_np, save_dir
-            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            self._load_metric3d()
+            self.logger.info("Metric3D loaded (will infer per-window center frame on demand)")
 
-        # --- 3. FK: compute world joints --- #这是啥？
-        from lib.utils.rotation_conversions import axis_angle_to_matrix
+        # --- 3. FK: compute world joints --- #这是前向传播吗？
+        from lib.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle
         with torch.no_grad():
-            joints_world = self.endecoder.fk_v2( #世界坐标系下的人体joints
+            joints_world = self.endecoder.fk_v2(
                 body_pose=body_pose_aa.unsqueeze(0).to(self.device),
                 betas=betas.unsqueeze(0).to(self.device),
                 global_orient=global_orient_w.unsqueeze(0).to(self.device),
                 transl=global_trans.unsqueeze(0).to(self.device),
-            )  # (1, F, 22, 3)
+            )
             joints_world = joints_world[0].cpu()  # (F, 22, 3)
 
         # --- 4. Prepare 2D keypoints ---
         kp2d = None
-        bbox_height = None
-        # Try to find ViTPose COCO-17 keypoints from HPE output
         if 'vitpose_kp2d' in data.metadata:
-            kp2d = _to_tensor(data.metadata['vitpose_kp2d'])  # (F, 17, 3)
+            kp2d = _to_tensor(data.metadata['vitpose_kp2d'])
             self.logger.info(f"Using ViTPose COCO-17 keypoints: {kp2d.shape}")
-        # Otherwise, project joints as pseudo-2D keypoints (self-consistency, weak signal)
         if kp2d is None:
-            self.logger.info("No external 2D keypoints, using projected joints as pseudo-kp2d (weak self-consistency)")
+            self.logger.info("No external 2D keypoints, using projected joints as pseudo-kp2d")
             pj2d, _ = self._project_joints(joints_world[:, :22], R_cw, t_cw, K)
-            # Create pseudo kp2d in COCO-17 format using FK→COCO mapping
             kp2d = torch.zeros(F_total, 17, 3)
-            # FK→COCO: 1→11, 2→12, 4→13, 5→14, 7→15, 8→16, 13→5, 14→6, 18→7, 19→8, 20→9, 21→10
             _fk2coco = {1:11, 2:12, 4:13, 5:14, 7:15, 8:16, 13:5, 14:6, 18:7, 19:8, 20:9, 21:10}
             for fk_idx, coco_idx in _fk2coco.items():
                 kp2d[:, coco_idx, :2] = pj2d[:, fk_idx]
-                kp2d[:, coco_idx, 2] = 1.0  # confidence
+                kp2d[:, coco_idx, 2] = 1.0
 
-        # Compute bbox height from joint spread
-        if bbox_height is None:
-            pj_for_bbox, _ = self._project_joints(joints_world[:, :22], R_cw, t_cw, K)
-            bbox_height = pj_for_bbox[:, :, 1].max(dim=1).values - pj_for_bbox[:, :, 1].min(dim=1).values
-            bbox_height = bbox_height.clamp(min=50.0)
-
-        # Get image size
         img0 = np.array(Image.open(data.image_paths[0]))
         img_h, img_w = img0.shape[:2]
 
-        # --- 4b. Pre-OAR 2D projections (for diagnostic vis) --- #将世界坐标系转换到相机坐标系下，使用CLIFF的K
-        proj_2d_pre = self._compute_per_frame_projections(joints_world, R_cw, t_cw, K)
-        # Camera-space joints for depth vis
-        _, joints_cam_pre = self._project_joints(joints_world, R_cw, t_cw, K)
-        
-        # --- 5. Sliding window optimization --- #这个逻辑是一定会开启的，通过修改transl来修改pose?
-        delta_transl, delta_orient = self._sliding_window_optimize( #输出的是delta_transl和delta_orient，但是其实我就想改pose
-            joints_world=joints_world,
-            R_cw=R_cw,
-            t_cw=t_cw,
-            K=K,
-            kp2d=kp2d,
-            depth_maps=depth_maps,
-            contact_conf=static_conf_logits,
-            bbox_height=bbox_height,
-            masks=data.masks,
-            img_h=img_h,
-            img_w=img_w,
+        # --- 5. Load SMPL-X model for rendering (一次性加载) ---
+        import cv2
+        smplx_model, smplx2smpl, faces_smpl = None, None, None
+        p3d_renderer = None
+        vis_output_dir = os.path.join(
+            data.metadata.get('output_dir', os.path.join('results', data.sequence_name)),
+            data.sequence_name,
         )
+        try:
+            smplx_model, smplx2smpl, faces_smpl = self._load_smplx_for_render()
+            from lib.vis.renderer import Renderer as Pytorch3dRenderer
+            focal_length = float(K[0, 0])
+            p3d_renderer = Pytorch3dRenderer(img_w, img_h, focal_length, self.device, faces_smpl)
+            self.logger.info("Loaded SMPL-X + Renderer for window visualization")
+        except Exception as e:
+            self.logger.warning(f"Cannot load SMPL-X/Renderer for window vis: {e}")
+
+        # --- 6. Sliding-window pipeline: per-window independent ---
+        # 渲染偏移量
+        render_offsets = self.config.get('render_offsets', [-10, -5, 0, 5, 10])
+
+        # gauss_w 在窗口内优化中仍有使用
+        gauss_offsets = torch.arange(-half_win, half_win + 1).float()
+        gauss_w = torch.exp(-gauss_offsets ** 2 / (2 * sigma ** 2))
+        gauss_w = gauss_w / gauss_w.max()
+
+        # 存储每个窗口独立结果
+        window_results = []
+
+        num_windows = 0
+        for center in range(0, F_total, stride):
+            start = max(0, center - half_win)
+            end = min(F_total, center + half_win + 1)
+            win_len = end - start
+
+            # ---- Step A: 创建窗口独立 transl 副本 ----
+            win_transl = global_trans[start:end].clone()  # (win_len, 3) 独立副本
+            win_body_pose = body_pose_aa[start:end].clone()  # (win_len, 63) 独立副本
+
+            # ---- Step B: 渲染 PRE-refine 的 5 帧 SMPL (debug) ----
+            if smplx_model is not None and p3d_renderer is not None:
+                try:
+                    self._render_window_smpl(
+                        center=center,
+                        global_orient_w=global_orient_w,
+                        body_pose_aa=win_body_pose,  # 用窗口的 body_pose（此时还是原始的）
+                        betas=betas,
+                        win_transl=win_transl,
+                        win_start=start,
+                        win_end=end,
+                        R_cw=R_cw, t_cw=t_cw, K=K,
+                        image_paths=data.image_paths,
+                        output_dir=vis_output_dir,
+                        tag='pre',
+                        render_offsets=render_offsets,
+                        smplx_model=smplx_model,
+                        smplx2smpl=smplx2smpl,
+                        faces_smpl=faces_smpl,
+                        renderer=p3d_renderer,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Window {center} pre-render failed: {e}")
+
+            # ---- Step B2: PRE-render 后先做 pp_static_joint 纠正滑步 ----
+            win_orient = global_orient_w[start:end]
+            win_betas = betas[start:end]
+            win_static = static_conf_logits[start:end] if static_conf_logits is not None else None
+            center_local = center - start
+            win_transl = self._apply_pp_static_joint(
+                win_orient, win_body_pose, win_betas, win_transl, win_static,
+                center_idx=center_local,
+            )
+
+            # ---- Step C: 中心帧深度图推理（按需，相机坐标系） ----
+            center_depth_map = None
+            if self.config['enable_depth_constraint'] and self.metric3d_model is not None:
+                try:
+                    center_depth_map = self._infer_single_depth(
+                        data.image_paths[center], intrinsics_np,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Window {center} depth inference failed: {e}")
+
+            # ---- Step C2: Depth Contact Debug 可视化 ----
+            if center_depth_map is not None:
+                try:
+                    self._vis_depth_contact_debug(
+                        center=center,
+                        start=start,
+                        end=end,
+                        global_orient_w=global_orient_w,
+                        body_pose_aa=win_body_pose,
+                        betas=betas,
+                        win_transl=win_transl,
+                        static_conf_logits=static_conf_logits,
+                        depth_map=center_depth_map,
+                        R_cw=R_cw, t_cw=t_cw, K=K,
+                        image_path=data.image_paths[center],
+                        output_dir=vis_output_dir,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Window {center} depth contact debug failed: {e}")
+
+            # ---- Step E: 渲染 POST-refine 的 5 帧 SMPL (debug) ----
+            if smplx_model is not None and p3d_renderer is not None:
+                try:
+                    self._render_window_smpl( #会在这里进行w2c变换
+                        center=center,
+                        global_orient_w=global_orient_w,
+                        body_pose_aa=win_body_pose,
+                        betas=betas,
+                        win_transl=win_transl,
+                        win_start=start,
+                        win_end=end,
+                        R_cw=R_cw, t_cw=t_cw, K=K,
+                        image_paths=data.image_paths,
+                        output_dir=vis_output_dir,
+                        tag='post_pre_dep',
+                        render_offsets=render_offsets,
+                        smplx_model=smplx_model,
+                        smplx2smpl=smplx2smpl,
+                        faces_smpl=faces_smpl,
+                        renderer=p3d_renderer,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Window {center} post-render failed: {e}")
+
+            # ---- Step C3: Depth Contact IK (基于深度穿透信号优化 body_pose) ----
+            if center_depth_map is not None and self.config.get('enable_depth_contact_ik', True):
+                try:
+                    win_body_pose = self._apply_depth_contact_ik(
+                        global_orient_w=global_orient_w,
+                        body_pose_aa=win_body_pose,
+                        betas=betas,
+                        win_transl=win_transl,
+                        static_conf_logits=static_conf_logits,
+                        depth_map=center_depth_map,
+                        R_cw=R_cw, t_cw=t_cw, K=K,
+                        center=center,
+                        start=start,
+                        end=end,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Window {center} depth contact IK failed: {e}")
+
+            # ---- Step E: 渲染 POST-refine 的 5 帧 SMPL (debug) ----
+            if smplx_model is not None and p3d_renderer is not None:
+                try:
+                    self._render_window_smpl( #会在这里进行w2c变换
+                        center=center,
+                        global_orient_w=global_orient_w,
+                        body_pose_aa=win_body_pose,
+                        betas=betas,
+                        win_transl=win_transl,
+                        win_start=start,
+                        win_end=end,
+                        R_cw=R_cw, t_cw=t_cw, K=K,
+                        image_paths=data.image_paths,
+                        output_dir=vis_output_dir,
+                        tag='post',
+                        render_offsets=render_offsets,
+                        smplx_model=smplx_model,
+                        smplx2smpl=smplx2smpl,
+                        faces_smpl=faces_smpl,
+                        renderer=p3d_renderer,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Window {center} post-render failed: {e}")
+
+            # ---- Step F: 保存窗口结果 ----
+            window_results.append({
+                'center': center,
+                'start': start,
+                'end': end,
+                'transl': win_transl.clone(),        # (win_len, 3) 独立副本
+                'body_pose': win_body_pose.clone(),   # (win_len, 63)
+            })
+
+            num_windows += 1
+            if num_windows % 10 == 0:
+                self.logger.info(f"Processed {num_windows} windows (center={center})")
+
+        self.logger.info(f"Processed {num_windows} windows total")
+
+        # --- 7. 释放 Metric3D + 渲染模型 ---
+        self._unload_metric3d()
+        if smplx_model is not None:
+            del smplx_model, smplx2smpl, p3d_renderer
+            torch.cuda.empty_cache()
+
+        # --- 8. 全局修正（高斯加权合并 window_results）写回 data 供 eval ---
+        # 用 window_results 中每个窗口的 transl 和 body_pose 进行高斯距离加权合并
+        acc_transl = torch.zeros(F_total, 3)
+        acc_body_pose = torch.zeros(F_total, 63)
+        acc_t_weights = torch.zeros(F_total)
+        acc_bp_weights = torch.zeros(F_total)
+
+        for wr in window_results:
+            w_center, w_start, w_end = wr['center'], wr['start'], wr['end']
+            w_transl = wr['transl']       # (win_len, 3)
+            w_bp = wr['body_pose']         # (win_len, 63)
+            w_len = w_end - w_start
+
+            # 高斯权重：基于帧到中心帧的距离
+            frame_indices = torch.arange(w_start, w_end).float()
+            offsets = frame_indices - float(w_center)
+            w_gauss = torch.exp(-offsets ** 2 / (2 * sigma ** 2))
+            w_gauss = w_gauss / w_gauss.max()  # 中心帧权重=1
+
+            acc_transl[w_start:w_end] += w_gauss.unsqueeze(-1) * w_transl
+            acc_t_weights[w_start:w_end] += w_gauss
+
+            acc_body_pose[w_start:w_end] += w_gauss.unsqueeze(-1) * w_bp
+            acc_bp_weights[w_start:w_end] += w_gauss
+
+        # 归一化 transl
+        t_valid = acc_t_weights > 1e-6
+        global_trans_new = global_trans.clone()
+        global_trans_new[t_valid] = acc_transl[t_valid] / acc_t_weights[t_valid].unsqueeze(-1)
+
+        # 归一化 body_pose
+        bp_valid = acc_bp_weights > 1e-6
+        body_pose_new = body_pose_aa.clone()
+        body_pose_new[bp_valid] = acc_body_pose[bp_valid] / acc_bp_weights[bp_valid].unsqueeze(-1)
 
         self.logger.info(
-            f"OAR deltas - transl: mean={delta_transl.abs().mean():.4f}, max={delta_transl.abs().max():.4f}; "
-            f"orient: mean={delta_orient.abs().mean():.6f}, max={delta_orient.abs().max():.6f}"
+            f"OAR global merge - transl delta: mean={( global_trans_new - global_trans).abs().mean():.4f}, "
+            f"max={(global_trans_new - global_trans).abs().max():.4f}, "
+            f"body_pose delta: mean={(body_pose_new - body_pose_aa).abs().mean():.4f}, "
+            f"max={(body_pose_new - body_pose_aa).abs().max():.4f}"
         )
 
-        # --- 6. Apply corrections ---
-        from lib.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle
-
-
-        # Apply orient correction
-        if self.config['enable_orient_refine']:
-            orient_mat_orig = axis_angle_to_matrix(global_orient_w)  # (F, 3, 3)
-            delta_orient_mat = axis_angle_to_matrix(delta_orient)     # (F, 3, 3)
-            orient_mat_new = delta_orient_mat @ orient_mat_orig
-            global_orient_w_new = matrix_to_axis_angle(orient_mat_new)
-        else:
-            global_orient_w_new = global_orient_w
-
-        # Apply transl correction
-        global_trans_new = global_trans + delta_transl
-
-        # --- 6b. Reprojection 劣化回滚保障 ---
-        # 比较 PRE 和 POST 的 reproj error，如果恶化超过阈值则回滚
-        _rollback_threshold = 1.5  # POST > 1.5x PRE 则回滚
-        _rolled_back = False
-        if kp2d is not None and self.config['enable_rollback_check']:
-            _fk2coco_rb = {1:11, 2:12, 4:13, 5:14, 7:15, 8:16, 13:5, 14:6, 18:7, 19:8, 20:9, 21:10}
-            _fk_idxs_rb = [k for k in _fk2coco_rb.keys()]
-            _coco_idxs_rb = [v for v in _fk2coco_rb.values()]
-
-            with torch.no_grad():
-                # POST-OAR FK joints
-                joints_world_post_check = self.endecoder.fk_v2(
-                    body_pose=body_pose_aa.unsqueeze(0).to(self.device),
-                    betas=betas.unsqueeze(0).to(self.device),
-                    global_orient=global_orient_w_new.unsqueeze(0).to(self.device),
-                    transl=global_trans_new.unsqueeze(0).to(self.device),
-                )[0].cpu()
-
-                proj_post_check = self._compute_per_frame_projections(
-                    joints_world_post_check, R_cw, t_cw, K
-                )  # (F, J, 2)
-
-                # 计算 PRE/POST 平均 reproj error（仅高置信度关节）
-                conf_all = kp2d[:, _coco_idxs_rb, 2]  # (F, N_pairs)
-                mask_all = conf_all > 0.5
-
-                gt_kp = kp2d[:, _coco_idxs_rb, :2]  # (F, N_pairs, 2)
-
-                pre_diff = (proj_2d_pre[:, _fk_idxs_rb] - gt_kp).norm(dim=-1)  # (F, N_pairs)
-                post_diff = (proj_post_check[:, _fk_idxs_rb] - gt_kp).norm(dim=-1)  # (F, N_pairs)
-
-                pre_err_mean = pre_diff[mask_all].mean().item() if mask_all.any() else 0.0
-                post_err_mean = post_diff[mask_all].mean().item() if mask_all.any() else 0.0
-
-                self.logger.info(
-                    f"[OAR Rollback Check] PRE reproj={pre_err_mean:.1f}px, "
-                    f"POST reproj={post_err_mean:.1f}px, "
-                    f"ratio={post_err_mean / max(pre_err_mean, 1e-6):.2f}"
-                )
-
-                if pre_err_mean > 0 and post_err_mean > pre_err_mean * _rollback_threshold:
-                    self.logger.warning(
-                        f"[OAR ROLLBACK] POST reproj ({post_err_mean:.1f}px) > "
-                        f"{_rollback_threshold}x PRE ({pre_err_mean:.1f}px), "
-                        f"reverting OAR corrections!"
-                    )
-                    global_orient_w_new = global_orient_w
-                    global_trans_new = global_trans
-                    _rolled_back = True
-
-        #self.logger.inf(f"new pose:{body_pose_new} pre_pose:{body_pose_aa}")
-        # --- 7. Image model 3D body pose refinement (四肢纠正) ---
+        # --- 9. Image model 3D body pose refinement (保留但可关闭) ---
         phmr_img_smpl = data.metadata.get('phmr_img_smpl', None)
         if (self.config['enable_img_pose_refine']
-                and phmr_img_smpl is not None
-                and not _rolled_back):
+                and phmr_img_smpl is not None):
             self.logger.info("Running image-model 3D body pose refinement (body-local space)...")
-            img_j3d_local = self._prepare_img_model_joints(
-                phmr_img_smpl, betas,
-            )
-            body_pose_aa = self._refine_body_pose_with_img_model(
-                body_pose_aa, betas, img_j3d_local,
+            img_j3d_local = self._prepare_img_model_joints(phmr_img_smpl, betas)
+            body_pose_new = self._refine_body_pose_with_img_model(
+                body_pose_new, betas, img_j3d_local,
             )
         elif self.config['enable_img_pose_refine'] and phmr_img_smpl is None:
-            self.logger.info(
-                "Image-model body pose refinement enabled but no phmr_img_smpl in metadata, skipping"
-            )
+            self.logger.info("Image-model body pose refinement enabled but no phmr_img_smpl, skipping")
 
-        # --- 8. Optional IK correction ---
-        if self.config['enable_ik'] and not _rolled_back:
-            self.logger.info("Running IK correction after OAR...")
-            body_pose_new = self._apply_ik_correction(
-                global_orient_w_new, body_pose_aa, betas, global_trans_new,
-                static_conf_logits,
-            )
-        else:
-            body_pose_new = body_pose_aa
-            if _rolled_back:
-                self.logger.info("Skipping IK correction due to OAR rollback")
-
-        #展示变化量：
-        self.logger.info(f"OAR deltas - transl: mean={delta_transl.abs().mean():.4f}, max={delta_transl.abs().max():.4f}; "
-            f"orient: mean={delta_orient.abs().mean():.6f}, max={delta_orient.abs().max():.6f}")
-        dif_pose = body_pose_new - body_pose_aa
-        self.logger.info(f"new pose:{body_pose_new} pre_pose:{body_pose_aa} difference:{dif_pose.abs().mean()}")
-        
-        
-        # --- 9. Update data ---
-        data.smpl_params.global_orient_w = global_orient_w_new
+        # --- 11. Update data ---
+        data.smpl_params.global_orient_w = global_orient_w
         data.smpl_params.global_trans = global_trans_new
         data.smpl_params.transl_w_raw = global_trans_new.clone()
         data.smpl_params.body_pose_aa = body_pose_new
 
-        # Store metadata
+        # Store window results in metadata for downstream (adjacent_render, SLAM)
+        data.metadata['oar_window_results'] = window_results
+
         data.metadata['oar_refine'] = {
-            'window_size': self.config['window_size'],
-            'stride': self.config['stride'],
+            'window_size': window_size,
+            'stride': stride,
             'opt_steps': self.config['opt_steps'],
-            'delta_transl_mean': delta_transl.abs().mean().item(),
-            'delta_orient_mean': delta_orient.abs().mean().item(),
-            'num_depth_frames': len(depth_maps),
+            'delta_transl_mean': (global_trans_new - global_trans).abs().mean().item(),
+            'num_windows': num_windows,
             'enable_depth_constraint': self.config['enable_depth_constraint'],
             'enable_ik': self.config['enable_ik'],
             'enable_orient_refine': self.config['enable_orient_refine'],
@@ -1531,50 +2075,62 @@ class DepthSceneRefineComponent(Component):
             'img_pose_refined': (
                 self.config['enable_img_pose_refine']
                 and phmr_img_smpl is not None
-                and not _rolled_back
             ),
-            'rolled_back': _rolled_back,
         }
 
-        # --- 10. Visualisation ---
-        base_output_dir = data.metadata.get('output_dir',
-                                        os.path.join('results', data.sequence_name))
-        vis_output_dir = os.path.join(base_output_dir, data.sequence_name)
+        # --- 12. Visualisation (before/after comparison) ---
         self._save_before_after_vis(data, pre_params, vis_output_dir)
 
-        # --- 10b. OAR 诊断可视化 ---
+        # --- 12b. 最终重投影可视化（所有窗口+IK处理完的最终结果） ---
+        self.logger.info("Generating final reprojection visualization...")
+        try:
+            with torch.no_grad():
+                joints_world_final = self.endecoder.fk_v2(
+                    body_pose=body_pose_new.unsqueeze(0).to(self.device),
+                    betas=betas.unsqueeze(0).to(self.device),
+                    global_orient=global_orient_w.unsqueeze(0).to(self.device),
+                    transl=global_trans_new.unsqueeze(0).to(self.device),
+                )[0].cpu()
+
+            proj_2d_pre = self._compute_per_frame_projections(joints_world, R_cw, t_cw, K)
+            proj_2d_final = self._compute_per_frame_projections(joints_world_final, R_cw, t_cw, K)
+
+            vis_stride = self.config.get('vis_oar_frame_stride', 5)
+            if kp2d is not None:
+                self._vis_reprojection_error(
+                    kp2d, proj_2d_pre, proj_2d_final,
+                    data.image_paths, vis_output_dir,
+                    frame_stride=vis_stride,
+                )
+                self._vis_keypoints_2d(
+                    kp2d, proj_2d_final, data.image_paths,
+                    vis_output_dir, frame_stride=vis_stride, tag='final',
+                )
+        except Exception as e:
+            self.logger.warning(f"Final reprojection visualization failed: {e}")
+
+        # --- 12c. OAR 诊断可视化 ---
         if self.config.get('vis_oar_diagnostics', False):
             self.logger.info("Generating OAR diagnostic visualizations...")
             vis_stride = self.config.get('vis_oar_frame_stride', 5)
 
-            # Post-OAR FK joints in world space
+            proj_2d_pre = self._compute_per_frame_projections(joints_world, R_cw, t_cw, K)
+            _, joints_cam_pre = self._project_joints(joints_world, R_cw, t_cw, K)
+
             with torch.no_grad():
                 joints_world_post = self.endecoder.fk_v2(
                     body_pose=body_pose_new.unsqueeze(0).to(self.device),
                     betas=betas.unsqueeze(0).to(self.device),
-                    global_orient=global_orient_w_new.unsqueeze(0).to(self.device),
+                    global_orient=global_orient_w.unsqueeze(0).to(self.device),
                     transl=global_trans_new.unsqueeze(0).to(self.device),
                 )
                 joints_world_post = joints_world_post[0].cpu()
 
-            proj_2d_post = self._compute_per_frame_projections( #差别来源于world的trans的调整
-                joints_world_post, R_cw, t_cw, K
-            )
-            _, joints_cam_post = self._project_joints(
+            proj_2d_post = self._compute_per_frame_projections(
                 joints_world_post, R_cw, t_cw, K
             )
 
             try:
-                # 1. 深度图可视化
-                if depth_maps:
-                    self._vis_depth_maps(
-                        depth_maps, data.image_paths,
-                        joints_cam_pre, proj_2d_pre,
-                        vis_output_dir,
-                        kp2d=kp2d,
-                    )
-
-                # 2. 2D 关键点可视化 (OAR 前后)
                 if kp2d is not None:
                     self._vis_keypoints_2d(
                         kp2d, proj_2d_pre, data.image_paths,
@@ -1584,9 +2140,6 @@ class DepthSceneRefineComponent(Component):
                         kp2d, proj_2d_post, data.image_paths,
                         vis_output_dir, frame_stride=vis_stride, tag='post',
                     )
-
-                # 3. 重投影误差可视化 (前后对比)
-                if kp2d is not None: #这里报告了有差别
                     self._vis_reprojection_error(
                         kp2d, proj_2d_pre, proj_2d_post,
                         data.image_paths, vis_output_dir,

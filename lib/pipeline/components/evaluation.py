@@ -321,7 +321,7 @@ class EvaluationComponent(Component):
         - pelvis_idxs = [2, 3]（与 WHAM/GVHMR 评估一致）
         - betas 只取前 10 维
         """
-        from lib.utils.rotation_conversions import axis_angle_to_matrix, matrix_to_axis_angle
+        from lib.utils.rotation_conversions import axis_angle_to_matrix
         
         self._ensure_j_regressor_h36m()
         j_reg = self._J_regressor_h36m_14  # (14, 6890)
@@ -369,27 +369,15 @@ class EvaluationComponent(Component):
             default_smpl=True,
         )
         
-        # 相机坐标系下的 GT SMPL
-        poses_root_cam = matrix_to_axis_angle(
-            tt(ext[:, :3, :3]) @ axis_angle_to_matrix(tt(poses_root))
-        )
-        # cam_trans = R_w2c @ trans_w + t_w2c
-        cam_trans = (
-            torch.einsum('bij,bj->bi', tt(ext[:, :3, :3]), tt(trans))
-            + tt(ext[:, :3, 3])
-        )
-        gt_cam = self._smpls[gender](
-            body_pose=tt(poses_body),
-            global_orient=poses_root_cam,
-            betas=tt(betas),
-            transl=cam_trans,
-            pose2rot=True,
-            default_smpl=True,
-        )
+        # 相机坐标系下的 GT：直接对世界坐标系顶点做 T_w2c 刚体变换
+        # 与 GVHMR 官方 metric_3dpw.py 的做法一致：apply_T_on_points(target_w_verts, T_w2c)
+        R_w2c = tt(ext[:, :3, :3])
+        t_w2c = tt(ext[:, :3, 3])
+        gt_vert_cam = torch.einsum('bij,bnj->bni', R_w2c, gt.vertices) + t_w2c[:, None, :]
         
         # 用 J_regressor_h36m_14 回归 14 关节
-        gt_j3d = torch.matmul(j_reg, gt.vertices)          # (N, 14, 3)
-        gt_j3d_cam = torch.matmul(j_reg, gt_cam.vertices)  # (N, 14, 3)
+        gt_j3d = torch.matmul(j_reg, gt.vertices)       # (N, 14, 3)
+        gt_j3d_cam = torch.matmul(j_reg, gt_vert_cam)   # (N, 14, 3)
         
         self.logger.info(
             f"[3DPW] GT loaded: {gt_j3d.shape[0]} frames, "
@@ -406,7 +394,7 @@ class EvaluationComponent(Component):
             'gt_vert': gt.vertices,
             'gt_ori': axis_angle_to_matrix(tt(poses_root)),
             'gt_j3d_cam': gt_j3d_cam,
-            'gt_vert_cam': gt_cam.vertices,
+            'gt_vert_cam': gt_vert_cam,
             'ext': ext,
             'valid_mask': valid_mask,
         }

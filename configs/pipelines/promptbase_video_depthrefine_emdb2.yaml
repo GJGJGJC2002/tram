@@ -1,25 +1,22 @@
-# PromptHMR + SLAM WorldTransform + OAR Depth Refinement Pipeline (EMDB1)
-#
-# 在 WorldTransform 之后插入 OAR (Optical-Anchored Refinement) 组件，
-# 利用 Metric3D 深度图 + 2D 重投影约束，以滑动窗口方式精修
-# global_orient / body_pose / global_trans。
+# PromptHMR Video Base + Warmstart Pipeline (EMDB1 - InCam Evaluation)
+# 基于 promptbase_video_emdb1，增加 AdjacentSMPLRenderer + droid_warmstart
+# 将 adjacent_smpl_renderer 的所有渲染帧索引（rendered_indices）作为 forced keyframes
+# 不需要第一次 SLAM
 #
 # Pipeline 流程：
 #   1. Segmentation (SAM) - 人体分割
-#   2. SLAM (DROID) - 相机运动估计（return_keyframe_info）
-#   3. HPE (PromptHMR) - 人体姿态估计（static_cam=True）
-#   4. WorldTransform - 用 SLAM c2w 变换到世界坐标系
-#   5. DepthSceneRefine (OAR) - 滑动窗口光学锚定精修
-#   6. SkatingRemoval - 滑步消除（pp_static_joint + IK）
-#   7. Evaluation - 评估
+#   2. HPE (PromptHMR) - PromptHMR 推理（输出 global + incam 两套参数）
+#   3. SkatingRemoval - 滑步消除（pp_static_joint + IK）
+#   4. AdjacentSMPLRenderer (gvhmr_world) - 用 T_w2c 渲染邻帧 SMPL
+#   5. SLAM (droid_warmstart) - 使用渲染帧索引作为 forced keyframes + warmstart 策略
+#   6. Evaluation - 评估指标（仅 incam）
 
-name: "PromptHMR + OAR DepthRefine (EMDB1)"
+name: "PromptHMR Video Base + Warmstart Pipeline (EMDB1)"
 mode: "sequential"
 device: "cuda"
-output_dir: "results/promptbase_video_depthrefine_emdb1"
+output_dir: "results/promptbase_video_depthrefine_emdb2"
 
 components:
-  # 1. 人体分割
   - type: segmentation
     name: human_segmentation
     backend: sam
@@ -28,7 +25,6 @@ components:
       use_cache: true
       overwrite: false
 
-  # 2. 相机运动估计（DROID-SLAM, 保留关键帧信息）
   - type: slam
     name: camera_estimation
     backend: droid
@@ -40,13 +36,13 @@ components:
       use_cache: true
       overwrite: false
 
-  # 3. PromptHMR HPE（static_cam=True）
+  # 2. PromptHMR Preprocessing (HPE)
   - type: hpe
     name: gvhmr_preprocessing
     backend: prompthmr
     prompthmr_root: "../PromptHMR"
     gvhmr_root: "thirdparty/GVHMR"
-    static_cam: true
+    static_cam: true #PromptHMR的video head是不包含相机变化的
     f_mm: null
     phmr_ckpt: "data/pretrain/phmr/checkpoint.ckpt"
     phmr_vid_cfg: "data/pretrain/phmr_vid/prhmr_release_002.yaml"
@@ -54,14 +50,14 @@ components:
     mask_prompt: true
     img_size: 896
     use_mean_shape: true
-    substep_cache_use: true
-    substep_cache_overwrite: false 
+    # 子步骤缓存：VitPose + Image Model 结果缓存到磁盘
+    substep_cache_use: false
+    substep_cache_overwrite: true
     cache:
       enabled: true
       use_cache: true
       overwrite: false
-
-  # 4. 世界坐标系变换
+      
   - type: world_transform
     name: world_transform
     use_smooth_cam: true
@@ -85,13 +81,13 @@ components:
     opt_steps: 2
     opt_lr: 0.01
     # 损失权重
-    loss_reproj_w: 100
+    loss_reproj_w: 1000
     loss_depth_w: 1.0
     loss_smooth_vel_w: 0.25
-    loss_smooth_acc_w: 1000.25
+    loss_smooth_acc_w: 0.25
     loss_reg_w: 0.1
     # 功能开关
-    enable_depth_constraint: false
+    enable_depth_constraint: true
     enable_ik: true
     # 窗口内滑步修正模式: ik / pp_static_joint / none
     #   ik:              旋转矩阵空间加权平均修正 body_pose
@@ -101,7 +97,7 @@ components:
     enable_orient_refine: false       # 不修改全局 orientation，仅修正 transl
     # 图像模型 3D body pose 纠正（保留但关闭）
     enable_img_pose_refine: true
-    img_pose_opt_steps: 300
+    img_pose_opt_steps: 30
     img_pose_opt_lr: 0.005
     loss_img3d_w: 5.0
     loss_img3d_sigma: 0.1
@@ -120,49 +116,44 @@ components:
       use_cache: false
       overwrite: true
 
-  # 5. Adjacent Frame SMPL Rendering
-  # - type: adjacent_smpl_renderer
-  #   name: adjacent_frame_rendering
-  #   pre_dis: 5
-  #   num_adjacent_frames: 2
-  #   device: "cuda"
-  #   render_mode: "prompthmr_camera"  # PromptHMR incam vertices + SLAM c2w 帧间变换
-  #   cache:
-  #     enabled: true
-  #     use_cache: false  # 设为 true 时直接读取 adjacent_smpl 目录的图片
-  #     overwrite: true   # 设为 true 时删除原目录下所有图片再重新渲染
 
-  # # 6. 滑步消除
-  # - type: skating_removal
-  #   name: skating_removal
-  #   gvhmr_root: "thirdparty/GVHMR"
-  #   enable_static_joint: true
-  #   enable_ik: true
-  #   device: "cuda"
-  #   cache:
-  #     enabled: true
-  #     use_cache: false
-  #     overwrite: true
+  #4. Adjacent Frame SMPL Rendering (gvhmr_world mode)
+  - type: adjacent_smpl_renderer
+    name: adjacent_frame_rendering
+    pre_dis: 5
+    num_adjacent_frames: 1
+    device: "cuda"
+    render_mode: "prompthmr_camera"
+    frame_selection_mode: "uniform"
+    mesh_color_mode: "colorful"
+    uniform_mesh_color: [0.75, 0.75, 0.75]
+    mesh_render_style: "solid"  # 'solid' (实心填充) 或 'contour' (只画轮廓边缘，保留背景纹理)
+    contour_thickness: 3  # contour 模式下轮廓线宽度（像素）
+    gvhmr_root: "thirdparty/GVHMR"
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
 
-  # # 5. SLAM Warmstart (使用 rendered_indices 作为 forced keyframes)
-  # # 无需第一次 SLAM，自动从 adjacent_render_info 获取关键帧列表
-  # - type: slam
-  #   name: camera_estimation_warmstart
-  #   backend: droid_warmstart
-  #   use_masks: true
-  #   align_to_world: true
-  #   image_dir: null  # 自动从 adjacent_render_info 获取
-  #   enable_scale_alignment: false  # 无第一次 SLAM，不做尺度对齐
-  #   use_warmstart_poses: false
-  #   use_rendered_for_keyframes: true  # 关键帧使用渲染图像（带 SMPL mesh）
-  #   keyframe_render_mode: "adaptive"  # 所有关键帧（即所有渲染帧）都使用渲染图像
-  #   texture_threshold: 1
-  #   cache:
-  #     enabled: true
-  #     use_cache: false
-  #     overwrite: true
+  # 5. SLAM Warmstart (使用 rendered_indices 作为 forced keyframes)
+  # 无需第一次 SLAM，自动从 adjacent_render_info 获取关键帧列表
+  - type: slam
+    name: camera_estimation_warmstart
+    backend: droid_warmstart
+    use_masks: true
+    align_to_world: true
+    image_dir: null  # 自动从 adjacent_render_info 获取
+    enable_scale_alignment: false  # 无第一次 SLAM，不做尺度对齐
+    use_warmstart_poses: false
+    use_rendered_for_keyframes: true  # 关键帧使用渲染图像（带 SMPL mesh）
+    keyframe_render_mode: "adaptive"  # 所有关键帧（即所有渲染帧）都使用渲染图像
+    texture_threshold: 1
+    cache:
+      enabled: true
+      use_cache: false
+      overwrite: true
 
-  # 7. 评估
+  # 6. Evaluation (EMDB1: incam metrics only)
   - type: evaluation
     name: evaluation
     metrics:
@@ -170,11 +161,22 @@ components:
       - mpjpe
       - pve
       - accel
+      - w_mpjpe
+      - wa_mpjpe
+      - rte
+      - erve
+      - ate
+      - ate_s
     chunk_length: 100
     fps: 30
 
-# Hooks: OAR 前后可视化对比
+
+# Hooks
 hooks:
+  - stage: 'after_camera_estimation_warmstart'
+    function: 'lib.pipeline.hooks.visualize_camera_trajectory'
+    enabled: true
+
   - stage: 'after_gvhmr_preprocessing'
     function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
     enabled: true
@@ -182,18 +184,9 @@ hooks:
       output_subdir: 'incam_global_pre_skating'
       frame_range: [0, 5]
 
-  
-  - stage: 'after_world_transform'
+  - stage: 'before_evaluation'
     function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
     enabled: true
     params:
-      output_subdir: 'incam_global_pre_oar'
-      frame_range: [0, 50]
-
-  - stage: 'after_oar_refine'
-    function: 'lib.pipeline.hooks.visualize_incam_global_gvhmr'
-    enabled: true
-    params:
-      output_subdir: 'incam_global_post_oar'
-      frame_range: [0, 50]
-
+      output_subdir: 'incam_global_before_eval'
+      frame_range: [0, 5]

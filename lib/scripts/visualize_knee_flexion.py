@@ -403,36 +403,54 @@ def compute_sequence_vertices(smpl_model, poses_root, poses_body, betas, trans):
     return torch.cat(all_verts, dim=0)  # (F, V, 3)
 
 
-def align_frame_face_z(verts_frame):
+def compute_face_z_transform(verts_frame):
     """
-    对单帧 vertices 做 face-z 对齐：root-align + 面朝 Z 轴。
-    每帧独立计算朝向，确保所有方法在同一帧的渲染朝向一致。
+    计算单帧 face-z 对齐的变换参数（offset + rotation），不实际变换。
+    用于以 GT 朝向为基准，统一应用到所有方法。
 
     Args:
-        verts_frame: (V, 3) tensor, 单帧 SMPL vertices
+        verts_frame: (V, 3) tensor
     Returns:
-        verts: (V, 3) numpy array, root-aligned 且面朝 Z 轴
+        offset: (3,) tensor — pelvis offset (Y=地面最低点)
+        T_ay2ayfz: (1, 4, 4) tensor — face-z 旋转变换矩阵
     """
-    from hmr4d.utils.geo_transform import compute_T_ayfz2ay, apply_T_on_points
+    from hmr4d.utils.geo_transform import compute_T_ayfz2ay
     from einops import einsum as einops_einsum
 
     J_regressor = _get_J_regressor()
     device = J_regressor.device
 
-    # 扩展为 (1, V, 3)
     verts = verts_frame.clone().unsqueeze(0).to(device)
 
-    # root-align: 减去 pelvis, Y 对齐到地面
     joints = einops_einsum(J_regressor, verts[0], "j v, v i -> j i")
-    offset = joints[0].clone()  # pelvis
-    offset[1] = verts[0, :, 1].min()  # 站在地面
-    verts = verts - offset
+    offset = joints[0].clone()
+    offset[1] = verts[0, :, 1].min()
 
-    # 面朝 Z 轴旋转（基于当前帧的 hip/shoulder 朝向）
-    joints_for_rot = einops_einsum(J_regressor, verts, "j v, l v i -> l j i")  # (1, J, 3)
+    # 先减去 offset 再算旋转
+    verts_centered = verts - offset
+    joints_for_rot = einops_einsum(J_regressor, verts_centered, "j v, l v i -> l j i")
     T_ay2ayfz = compute_T_ayfz2ay(joints_for_rot, inverse=True)
-    verts = apply_T_on_points(verts, T_ay2ayfz)
 
+    return offset, T_ay2ayfz
+
+
+def apply_face_z_transform(verts_frame, offset, T_ay2ayfz):
+    """
+    用给定的变换参数对齐单帧 vertices。
+
+    Args:
+        verts_frame: (V, 3) tensor
+        offset: (3,) tensor — from compute_face_z_transform
+        T_ay2ayfz: (1, 4, 4) tensor — from compute_face_z_transform
+    Returns:
+        verts: (V, 3) numpy array
+    """
+    from hmr4d.utils.geo_transform import apply_T_on_points
+
+    device = offset.device
+    verts = verts_frame.clone().unsqueeze(0).to(device)
+    verts = verts - offset
+    verts = apply_T_on_points(verts, T_ay2ayfz)
     return verts[0].cpu().numpy()
 
 
@@ -494,17 +512,19 @@ def create_figure(seq_name, seq_dir, gt_data, pred_data_list, method_labels,
         pred_verts = ensure_y_up(pred_verts)
         pred_verts_seqs.append(pred_verts)
 
-    # --- 渲染下半身 mesh（每帧独立做 face-z 对齐） ---
+    # --- 渲染下半身 mesh（各方法独立 face-z 对齐） ---
     def render_all_at_frame(frame_idx):
         renders = []
         # GT
-        verts = align_frame_face_z(gt_verts_seq[frame_idx])
+        gt_offset, gt_T = compute_face_z_transform(gt_verts_seq[frame_idx])
+        verts = apply_face_z_transform(gt_verts_seq[frame_idx], gt_offset, gt_T)
         renders.append(render_lower_body_pytorch3d(
             verts, lower_faces, GT_MESH_COLOR, device=device))
 
-        # 各方法
+        # 各方法（各自独立 face-z 对齐）
         for i, pred_verts in enumerate(pred_verts_seqs):
-            verts = align_frame_face_z(pred_verts[frame_idx])
+            pred_offset, pred_T = compute_face_z_transform(pred_verts[frame_idx])
+            verts = apply_face_z_transform(pred_verts[frame_idx], pred_offset, pred_T)
             color = MESH_COLORS_RGB[i % len(MESH_COLORS_RGB)]
             renders.append(render_lower_body_pytorch3d(
                 verts, lower_faces, color, device=device))
@@ -571,7 +591,7 @@ def create_figure(seq_name, seq_dir, gt_data, pred_data_list, method_labels,
     # ---- Row 3: 下半身 mesh ----
     total_mesh_cols = n_mesh_cols * 2 + 1  # +1 for gap between t1 and t2
     gs_mesh = gridspec.GridSpecFromSubplotSpec(
-        1, total_mesh_cols, subplot_spec=gs[2], wspace=0.02)
+        1, total_mesh_cols, subplot_spec=gs[2], wspace=0.001)
 
     all_labels = ['GT'] + method_labels
     all_colors_hex = [METHOD_COLORS_HEX['GT']] + method_colors
@@ -582,17 +602,82 @@ def create_figure(seq_name, seq_dir, gt_data, pred_data_list, method_labels,
             ax = fig.add_subplot(gs_mesh[0, col_offset + j])
             ax.imshow(render_img)
             ax.axis('off')
-            ax.set_title(all_labels[j], fontsize=11,
+            ax.set_title(all_labels[j], fontsize=14,
                          color=all_colors_hex[j], fontweight='bold')
 
     plt.suptitle(f'Left Knee Flexion Comparison — {seq_name}',
                  fontsize=16, fontweight='bold', y=0.98)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    plt.savefig(output_path, dpi=150, bbox_inches='tight',
-                facecolor='white', edgecolor='none')
+    save_kwargs = dict(bbox_inches='tight', facecolor='white', edgecolor='none')
+    if not output_path.lower().endswith('.svg'):
+        save_kwargs['dpi'] = 150
+    plt.savefig(output_path, **save_kwargs)
     plt.close()
     print(f"Figure saved to: {output_path}")
+
+
+def create_minimal_figure(seq_name, gt_data, pred_data_list, method_labels,
+                         t1, t2, frame_range, output_path):
+    """纯净模式：只绘制角度曲线，宽度随帧数自适应。"""
+    
+    n_methods = len(method_labels)
+    fstart, fend = frame_range
+    n_frames = fend - fstart
+    
+    # 膝关节角度
+    gt_angles = extract_knee_flexion(gt_data['poses_body'], 'left_knee')
+    pred_angles_list = [extract_knee_flexion(p['poses_body'], 'left_knee')
+                        for p in pred_data_list]
+    
+    # 方法颜色
+    palette = METHOD_COLORS_HEX['palette']
+    method_colors = [palette[i % len(palette)] for i in range(n_methods)]
+    
+    # 根据帧数自适应宽度：每100帧约4英寸，最小8英寸
+    fig_width = max(8.0, n_frames / 100 * 4.0)
+    fig_height = 5.0
+    
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    
+    frames = np.arange(fstart, fend)
+    
+    # 绘制 GT
+    ax.plot(frames, gt_angles[fstart:fend],
+            color=METHOD_COLORS_HEX['GT'], linewidth=2.5,
+            label='GT', alpha=0.8)
+    
+    # 绘制各方法
+    for i, (angles, label) in enumerate(zip(pred_angles_list, method_labels)):
+        ax.plot(frames, angles[fstart:fend],
+                color=method_colors[i], linewidth=2.0,
+                label=label, alpha=0.9)
+    
+    # t1, t2 标记线
+    ax.axvline(x=t1, color='gray', linestyle='--', alpha=0.6, linewidth=1.5)
+    ax.axvline(x=t2, color='gray', linestyle='--', alpha=0.6, linewidth=1.5)
+    
+    # 标签
+    ax.set_xlabel('Frame', fontsize=13)
+    ax.set_ylabel('Left Knee Flexion (°)', fontsize=13)
+    ax.set_xlim(fstart, fend)
+    ax.set_title(f'{seq_name} — Left Knee Flexion',
+                 fontsize=14, fontweight='bold', pad=12)
+    ax.legend(fontsize=11, loc='best', framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    plt.tight_layout()
+    
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    save_kwargs = dict(bbox_inches='tight', facecolor='white', edgecolor='none')
+    if not output_path.lower().endswith('.svg'):
+        save_kwargs['dpi'] = 150
+    plt.savefig(output_path, **save_kwargs)
+    plt.close()
+    print(f"Minimal figure saved to: {output_path}")
+
 
 
 # ============================================================
@@ -619,6 +704,8 @@ def main():
     parser.add_argument('--dataset_path', type=str, default='datasets/EMDB')
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--minimal', action='store_true',
+                        help='纯净模式：只绘制角度曲线，宽度自适应帧数')
 
     args = parser.parse_args()
 
@@ -635,7 +722,7 @@ def main():
         method_dirs.append(path)
 
     if args.output is None:
-        args.output = f'figures/knee_flexion_{args.seq}.png'
+        args.output = f'figures/knee_flexion_{args.seq}.svg'
 
     print(f"Loading GT data for {args.seq}...")
     seq_dir, ann_file = find_emdb_sequence(args.dataset_path, args.seq)
@@ -650,28 +737,46 @@ def main():
     n_frames = gt_data['n_frames']
     if args.frame_range is None:
         args.frame_range = [0, n_frames]
+    else:
+        # 支持 FRAME_END=-1 表示使用数据最后一帧
+        if args.frame_range[1] == -1:
+            args.frame_range[1] = n_frames
     args.frame_range[1] = min(args.frame_range[1], n_frames)
 
     assert args.frame_range[0] <= args.t1 < args.frame_range[1]
     assert args.frame_range[0] <= args.t2 < args.frame_range[1]
 
-    print("Loading SMPL model...")
-    smpl_model = SMPL(gender=gt_data['gender'])
+    if args.minimal:
+        # 纯净模式：只需要角度数据，不需要 SMPL 模型和渲染
+        create_minimal_figure(
+            seq_name=args.seq,
+            gt_data=gt_data,
+            pred_data_list=pred_data_list,
+            method_labels=method_labels,
+            t1=args.t1,
+            t2=args.t2,
+            frame_range=args.frame_range,
+            output_path=args.output,
+        )
+    else:
+        # 完整模式：需要 SMPL 模型和渲染
+        print("Loading SMPL model...")
+        smpl_model = SMPL(gender=gt_data['gender'])
 
-    create_figure(
-        seq_name=args.seq,
-        seq_dir=seq_dir,
-        gt_data=gt_data,
-        pred_data_list=pred_data_list,
-        method_labels=method_labels,
-        t1=args.t1,
-        t2=args.t2,
-        frame_range=args.frame_range,
-        output_path=args.output,
-        num_image_frames=args.num_image_frames,
-        smpl_model=smpl_model,
-        device=args.device,
-    )
+        create_figure(
+            seq_name=args.seq,
+            seq_dir=seq_dir,
+            gt_data=gt_data,
+            pred_data_list=pred_data_list,
+            method_labels=method_labels,
+            t1=args.t1,
+            t2=args.t2,
+            frame_range=args.frame_range,
+            output_path=args.output,
+            num_image_frames=args.num_image_frames,
+            smpl_model=smpl_model,
+            device=args.device,
+        )
 
 
 if __name__ == '__main__':
