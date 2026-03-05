@@ -1,29 +1,47 @@
+## 题目：EIHMR: Collaborative Human-Camera estimation for  for 4D Human Capture
+
 ## 摘要
 在仿真模拟和具身智能领域，获取高质量、大规模的人体运动与场景交互数据至关重要。从移动相机拍摄的单目视频中恢复全局三维人体运动是实现这一目标的重要途径，然而其中相机运动与人体运动在图像观测中紧密耦合，使得这一问题极具挑战性。现有方法相机估计与人体估计往往以单向流水线方式串联，缺乏显式的互促机制，使得某一环节的误差容易被级联放大。
 
 我们的方法受到人类认知过程的启发：人类在观察他人运动时，会在想象中固定一个视角，依据场景线索重建出符合尺度的局部运动序列，再凭借对运动的理解实现对自身的定位以及对周围环境和他人的重建。基于这一洞察，我们提出了两阶段的EIHMR，为移动相机下的运动场景重建问题引入了一种全新的范式。场景感知局部子图重建将运动序列重投影到单一视角下，在度量深度和二维关键点约束下执行运动学和场景交互优化，以生成几何一致的局部运动。精炼后的运动随后被重新渲染到原始帧中，将动态人体区域转化为结构化的视觉特征，运动感知SLAM模块利用这些运动增强后的图像进行鲁棒的相机估计。在EMDB数据集上，EIHMR将全局轨迹误差降低了约11.5%，展现除了EIHMR在长距离场景对齐的人体动作重建任务具有卓越能力。
 
+## 导师意见：
+#### 姜老师：
+1.如果范式就和之前的方法有比较大的差别，可以在intro清楚地点出，可以配一张简单的图，大的范式区别是我们是把相机轨迹和人体轨迹进行了collaborate合作估计。在局部SA-LHMR用了的是相机运动和人体运动的解耦decouple。
+2.整体的写法要有一个核心点，并且不断地重复强化。不能用提出两个问题的写法。整体的结构要和下面的Method一致。
+3.Method的第一部分有些杂糅，把pipeline的意义和具体的流程融在了一起，可以参考yuzhi的方法来写。
+4.协作式人体相机联合估计，这个关键词要在描述前序工作缺点的时候，或者描述common 缺点的时候点出来，进行观点的强化，突出协作式，协作式也可以体现在标题中。
+5.这里提到了decouple，可以将此作为关键点体现在标题中？最好是前后说法一致。最好有一两个点，有一些fancy的理论支撑，而不是像随意设计的一样。需要突出难点，比如说以前的方法都耦合->受到人类启发可以解耦->解耦怎么怎么难->我们克服难点。
+6.这一段太长了，Why在intro里应该介绍，方法细节应该在后面的小节介绍。这一节只要简单讲一下pipeline就行。应该采用总分的形式。如果要简单介绍的话可以写个前言。需要梳理一下整体的逻辑。
+#### 王老师：题目要再精简，留下最为核心的思想
+#### 誉之: 感觉上面两个question的内容说的有点太繁杂了，可以尝试抓住一些关键词highlight或者斜体来论述，让读者直接抓住重点
+
+
+## GVHMR的intro示范：
+World-Grounded Human Motion Recovery (HMR) aims to reconstruct continuous 3D human motion within a gravity-aware world coordinate system. Unlike conventional motion captured in the camera frame [Kanazawa et al. 2018], world-grounded motion is inherently suitable as foundational data for generative and physical models, such as text-to-motion generation [Guo et al. 2022; Tevet et al. 2023] and humanoid robot imitation learning [He et al. 2024]. In these applications, motion sequences must be high-quality and consistent in a gravity-aware world coordinate system. 
+
+Most existing HMR methods can recover promising camera-space human motion from videos [Kocabas et al. 2020; Shen et al. 2023; Wei et al. 2022]. To recover the global motion, a straightforward approach is to use camera poses [Teed et al. 2024] to transform camera-space motion to world-space. However, the results are not guaranteed to be gravity-aligned, and errors in translations and poses can accumulate over time, resulting in implausible global motion. Recent work, WHAM [Shin et al. 2024], attempts to recover global motion by autoregressively predicting relative global poses with RNN. While this method achieves significant improvements, it requires a good initialization and suffers from accumulated errors over long sequences, making it challenging to maintain consistency in the gravity direction. We believe the inherent challenge stems from the ambiguity in defining the world coordinate system. Given the world coordinate axes, any rotation around the gravity axis defines a valid gravity-aware world coordinate system. 
+
+In this work, we propose GVHMR to estimate gravity-aware human poses for each frame and then compose them with gravity constraints to avoid accumulated errors in the gravity direction. This design is motivated by the observation that, for a person in any image, we humans are able to easily infer the gravity-aware human pose, as shown in Fig. 2. Additionally, given two consecutive frames, it is easier to estimate the 1-degree-of-freedom rotation around the gravity direction, compared to the full 3-degree-of-freedom rotation. Therefore, we propose a novel Gravity-View (GV) coordinate system, defined by the gravity and camera view directions. Using the GV system, we develop a network that predicts the gravity-aware human orientation. We also propose a recovery algorithm to estimate the relative rotation between GV systems, enabling us to align all frames into a consistent gravity-aware world coordinate system. 
+
+Thanks to the GV coordinates, we can process human rotations in parallel over time. We propose a transformer [Vaswani et al. 2017] model enhanced with Rotary Positional Embedding (RoPE) [Su et al. 2024] to directly regress the entire motion sequence. Compared to the commonly used absolute position encoding, RoPE better captures the relative relationships between video frames and handles long sequences more effectively. During inference, we introduce a mask to limit each frame's receptive field, avoiding the complex sliding windows and enabling parallel inference for infinitely long sequences. Additionally, we predict stationary labels for hands and feet, which are used to refine foot sliding and global trajectories. In summary, our contributions are threefold: 1. We propose a novel Gravity-View coordinate system and the global orientation recovery method to reduce the cumulative errors in the gravity direction. 2. We develop a Transformer model enhanced by RoPE to generalize to long sequences and improve motion estimation. 3. We demonstrate the effectiveness of our approach through extensive experiments, showing that it outperforms previous methods in both in-camera and world-grounded accuracy.
 
 ## Introduction
-从视觉数据中理解人类在世界中的移动方式是计算机视觉领域的一个基本问题。为了从视频中全面捕捉这种运动，我们不仅需要恢复人体运动学的姿态（Kinematic Poses），还需要恢复其在世界坐标系下的全局轨迹（图 1）。这一能力对于人体-场景交互理解、具身智能以及数字人动画等下游应用至关重要。当输入是由移动相机拍摄的单目视频时，该任务变得极具挑战性，因为相机的运动与人体的运动在图像观测中紧密耦合（Entangled）。
+Recovering global 3D human motion from monocular video constitutes a fundamental problem in computer vision. Beyond estimating kinematic body poses, this task requires recovering complete human trajectories within a world coordinate system to support downstream applications such as human-scene interaction understanding, embodied intelligence, and digital human animation. The challenge is especially acute when the input is captured by a moving camera, as camera ego-motion and human body motion are tightly entangled in the image observations, rendering their separation inherently ambiguous.
 
-现有的方法大致遵循两种范式。两阶段方法首先通过 SLAM 估计相机轨迹，然后独立重建人体姿态，最后通过坐标转换获得全局轨迹。然而，SLAM 阶段通常需要掩盖动态的人体区域以满足静态场景假设，当人体占据主要视野时，可用特征点大幅减少，导致相机估计质量下降；独立估计的人体姿态在映射到不准确的相机轨迹上时进一步受损，产生足部滑动和轨迹漂移。端到端方法尝试直接回归全局人体运动，然而这类方法受限于优先的训练数据量，暂未获得非常有效的效果。
+The prevailing paradigm addresses this challenge through a two-stage pipeline: camera trajectories are first estimated via visual SLAM, after which human body poses are independently reconstructed and transformed into world coordinates. However, this paradigm treats camera estimation and motion reconstruction as isolated processes, and this isolation introduces two critical limitations. On the camera side, SLAM must mask out dynamic human regions to satisfy the static-scene assumption; when the subject dominates the field of view, the available visual features are drastically reduced, severely degrading camera estimation quality. On the motion side, body poses estimated without access to scene geometry lack physically grounded spatial constraints, resulting in non-physical artifacts such as foot sliding, ground penetration, and floating limbs. These two sources of error are further amplified when combined in the world coordinate system.
 
-这些方法的共同瓶颈在于：相机估计与人体估计往往以单向流水线方式串联（相机→人体，或人体→相机），缺乏显式的互促机制，使得某一环节的误差容易被级联放大。我们认为，突破这一瓶颈需要回答两个关键问题：**（1）如何在移动相机引入的坐标系混乱下，仍然获得几何精确的局部人体运动？（2）如何让精确的人体运动以可利用的形式反过来提升相机的全局定位？**
+We posit that overcoming these limitations necessitates a collaborative human-camera estimation paradigm. Our approach draws inspiration from the human cognitive process of perceiving others' motion, hence the name Embodied Imagination HMR, EIHMR. When observing a moving person, humans do not passively register visual impressions; rather, they mentally anchor a stable viewpoint, leverage scene cues such as foot-ground contact to reconstruct a scale-consistent local motion sequence, and subsequently employ their kinematic understanding of the human body to localize themselves and reconstruct the surrounding environment. This decouple-then-collaborate cognitive loop, first isolating and refining local motion free of camera interference, then leveraging the refined motion to improve global camera estimation, motivates the design of our framework. Specifically, camera information provides scene anchors for the estimated motion sequences, facilitating scene-aware motion refinement, and the refined motion, in turn, enhances camera localization.
 
-对于第一个问题，我们的核心观察来自时序人体运动估计（Video/Temporal HMR）的局限：为了保持跨帧平滑，它在相机轨迹存在偏差时往往会牺牲与单帧图像观测的几何一致性，导致重建的人体逐渐偏离真实视频中的实际观测。将该结果投影到世界坐标系后，这些偏差会以更直观的方式暴露：本应静止接触的足部出现滑步与累积偏移，肢体与地面/楼梯发生穿透或悬空等不符合场景约束的伪影。人类在理解他人运动时并不会盲目接受视觉直觉，而是会在想象中固定一个观察视角，并依赖人体-场景接触关系（如脚-地面、手-物体）来校准和定位运动序列。受到这一启发，我们在关键帧视角下进行局部运动重建：将窗口内的运动统一投影到同一关键帧视角，从而消除相机运动干扰，在一个稳定的参考系中对运动进行度量与优化。在这一“冻结相机”的参考系下，度量深度估计、运动学约束等成熟技术得以直接施加，形成局部的子图重建，并为后续的全局对齐提供可靠锚点。
+Concretely, we propose EIHMR, Embodied Imagination Human Mesh Recovery, a collaborative framework that emulates the human ability to mentally simulate observed motion in an imagined stable reference frame. EIHMR comprises two complementary stages: Scene-Aware Local Human Motion Reconstruction, SA-LHMR, and Motion-aware SLAM, MO-SLAM. SA-LHMR reprojects motion sequences into a frozen keyframe viewpoint, thereby eliminating camera ego-motion interference, and applies metric depth and kinematic constraints via sliding-window optimization to produce geometrically consistent local motion free of non-physical artifacts. MO-SLAM re-renders the refined motion as geometrically consistent static meshes and injects them into the original frames, converting the human body from an excluded dynamic region into a source of dense, kinematically-aware matching cues that substantially strengthen camera estimation, particularly in human-dominated and texture-scarce scenarios. Together, the two stages realize a decouple-then-collaborate loop that supersedes the isolated, unidirectional information flow of prior work. Our contributions are summarized as follows:
 
-对于第二个问题，我们注意到现有方法将动态人体视为 SLAM 的"干扰源"并简单地将其掩盖。然而这恰恰浪费了画面中最具信息量的区域——人体通常占据视野的核心位置，在背景纹理稀疏的场景中甚至是唯一可靠的视觉线索来源。反观人类的视觉认知过程：当我们观察包含运动人体的场景时，我们并非盲目忽视人体，而是凭借自身的运动学先验——对人体骨骼结构、关节自由度和典型运动模式的内在理解——将运动的人体解读为具有确定几何结构的三维实体，从而辅助对自身位姿和周围环境的重建。受此启发，我们将精炼后的人体运动以几何一致的方式重新渲染到原始图像帧中。将原本干扰相机定位的动态人体转换为能提供稠密匹配线索的"协作伙伴"。
+\begin{enumerate}
+\item We introduce EIHMR, a collaborative human-camera co-estimation framework that first decouples human and camera motion in a frozen-camera reference frame for scene-aware refinement, and then feeds the refined motion back to augment camera estimation, establishing a bidirectional information flow absent in existing methods.
 
-基于上述两点洞察，我们提出 EIHMR：一种让“人体运动重建”与“相机轨迹估计”相互促进的协作框架，由场景感知局部运动重建（SA-LHMR）与运动感知 SLAM（MO-SLAM）两阶段组成。SA-LHMR 以关键帧视角构造统一参考系，将单帧与时序运动估计投影到同一视角下，并在度量深度与运动学约束下进行滑动窗口优化，得到运动学一致且场景可信的局部运动。MO-SLAM 将该局部运动以几何一致的方式渲染回原始帧，合成运动增强图像，使人体区域从“被排除的动态干扰”转变为可用于匹配的结构化线索，从而提升相机估计的稳健性。
+\item We propose SA-LHMR, which reprojects motion into a unified keyframe viewpoint and applies a two-stage refinement: root trajectory correction via forward-kinematics stationarity analysis, followed by contact-aware inverse kinematics guided by metric depth, effectively eliminating foot sliding and scene penetration artifacts.
 
-我们的贡献如下：
-
-我们引入了 EIHMR，一种将人体运动估计与相机轨迹恢复紧密耦合的协作式架构。该框架基于"固定视角感知局部运动、运动增强提升全局定位"的核心思想，打破了现有方法中人体与相机单向信息流动的局限。
-
-我们提出了场景感知局部运动重建模块（SA-LHMR），通过将单帧与时序运动估计统一到关键帧视角下，消除相机运动干扰，并在度量深度和运动学约束下执行两阶段精修（根轨迹修正 + 接触感知逆运动学），有效消除了足部滑动和场景穿透等非物理运动。
-
-我们提出了运动感知 SLAM 模块（MO-SLAM），它将精炼的人体运动渲染为几何一致的静态网格序列，通过强制关键帧注入、自适应图像替换和人体感知相关性权重，将人体从 SLAM 的干扰源转化为提供稠密匹配线索的结构化特征，在人体主导和低纹理场景中显著提升了相机估计的鲁棒性。
+\item We propose MO-SLAM, which re-renders refined human motion as geometrically consistent static meshes and integrates them into the SLAM pipeline through forced keyframe injection, adaptive image replacement, and human-aware correlation weighting, transforming the human body from a source of interference into structured features that provide dense matching cues and markedly improve camera estimation robustness.
+\end{enumerate}
 
 
 ### Pipeline

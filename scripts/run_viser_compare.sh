@@ -15,18 +15,18 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate alignHMR
 
 # ---------- 可配置参数 ----------
-SEQ="${SEQ:-09_outdoor_walk}"
+SEQ="${SEQ:-57_outdoor_rock_chair}"
 PORT="${PORT:-8080}"
-SUBSAMPLE="${SUBSAMPLE:-10}"
+SUBSAMPLE="${SUBSAMPLE:-20}"
 SHOW_GT="${SHOW_GT:-1}"
 DATASET_ROOT="${DATASET_ROOT:-datasets/EMDB}"
 SPREAD_GAP="${SPREAD_GAP:-1.0}"
 NO_SPREAD="${NO_SPREAD:-0}"
-START_FRAME="${START_FRAME:-50}"
-END_FRAME="${END_FRAME:-150}"
+START_FRAME="${START_FRAME:-0}"
+END_FRAME="${END_FRAME:-300}"
 
 # 方法列表（格式: Name:result_dir，空格分隔）
-METHODS="${METHODS:-Prompt:results/promptbase_video_warmstart_emdb2 Ours:results/gvhmr_base_warmstart}"
+METHODS="${METHODS:-Ours:results/gvhmr_base_warmstart Prompt:results/promptbase_video_warmstart_emdb2}"
 # ------------------------------------
 
 echo "=========================================="
