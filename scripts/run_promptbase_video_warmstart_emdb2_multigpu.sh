@@ -17,7 +17,7 @@ SPLIT=2
 DATASET_PATH="datasets/EMDB"
 
 # GPU 列表（可通过环境变量覆盖）
-GPU_IDS="${GPU_IDS:-0,1,2,3}"
+GPU_IDS="${GPU_IDS:-1,2,3}"
 
 # 解析 GPU 列表
 IFS=',' read -ra GPUS <<< "$GPU_IDS"

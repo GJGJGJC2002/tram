@@ -15,7 +15,7 @@ source ~/anaconda3/etc/profile.d/conda.sh
 conda activate alignHMR
 
 # ---------- 可配置参数 ----------
-SEQ="${SEQ:-57_outdoor_rock_chair}"
+SEQ="${SEQ:-09_outdoor_walk}"
 PORT="${PORT:-8080}"
 SUBSAMPLE="${SUBSAMPLE:-20}"
 SHOW_GT="${SHOW_GT:-1}"

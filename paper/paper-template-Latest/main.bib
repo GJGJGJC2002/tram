@@ -1,0 +1,712 @@
+% Long form of conference & journal abbreviations
+@String(PAMI  = {IEEE Trans. Pattern Anal. Mach. Intell.})
+@String(IJCV  = {Int. J. Comput. Vis.})
+@String(CVPR  = {IEEE Conf. Comput. Vis. Pattern Recog.})
+@String(ICCV  = {Int. Conf. Comput. Vis.})
+@String(ECCV  = {Eur. Conf. Comput. Vis.})
+@String(NeurIPS = {Adv. Neural Inform. Process. Syst.})
+@String(ICML  = {Int. Conf. Mach. Learn.})
+@String(ICLR  = {Int. Conf. Learn. Represent.})
+@String(ACCV  = {Asian Conf. Comput. Vis.})
+@String(BMVC  = {Brit. Mach. Vis. Conf.})
+@String(CVPRW = {IEEE Conf. Comput. Vis. Pattern Recog. Worksh.})
+@String(AAAI  = {AAAI})
+@String(IJCAI = {IJCAI})
+@String(TOG   = {ACM Trans. Graph.})
+@String(SIGGRAPH = {ACM SIGGRAPH})
+
+% Short form -- for submission version
+@String(PAMI  = {IEEE TPAMI})
+@String(IJCV  = {IJCV})
+@String(CVPR  = {CVPR})
+@String(ICCV  = {ICCV})
+@String(ECCV  = {ECCV})
+@String(NeurIPS = {NeurIPS})
+@String(ICML  = {ICML})
+@String(ICLR  = {ICLR})
+@String(ACCV  = {ACCV})
+@String(BMVC  = {BMVC})
+@String(CVPRW = {CVPRW})
+@String(AAAI  = {AAAI})
+@String(IJCAI = {IJCAI})
+@String(TOG   = {ACM TOG})
+@String(SIGGRAPH = {ACM SIGGRAPH})
+
+% ---- SMPL Body Model ----
+
+@article{SMPL,
+author = {Loper, Matthew and Mahmood, Naureen and Romero, Javier and Pons-Moll, Gerard and Black, Michael J.},
+title = {SMPL: a skinned multi-person linear model},
+year = {2015},
+issue_date = {November 2015},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+volume = {34},
+number = {6},
+issn = {0730-0301},
+abstract = {We present a learned model of human body shape and pose-dependent shape variation that is more accurate than previous models and is compatible with existing graphics pipelines. Our Skinned Multi-Person Linear model (SMPL) is a skinned vertex-based model that accurately represents a wide variety of body shapes in natural human poses. The parameters of the model are learned from data including the rest pose template, blend weights, pose-dependent blend shapes, identity-dependent blend shapes, and a regressor from vertices to joint locations. Unlike previous models, the pose-dependent blend shapes are a linear function of the elements of the pose rotation matrices. This simple formulation enables training the entire model from a relatively large number of aligned 3D meshes of different people in different poses. We quantitatively evaluate variants of SMPL using linear or dual-quaternion blend skinning and show that both are more accurate than a Blend-SCAPE model trained on the same data. We also extend SMPL to realistically model dynamic soft-tissue deformations. Because it is based on blend skinning, SMPL is compatible with existing rendering engines and we make it available for research purposes.},
+journal = {ACM Trans. Graph.},
+month = nov,
+articleno = {248},
+numpages = {16},
+keywords = {blendshapes, body shape, skinning, soft-tissue}
+}
+
+
+
+% ---- Optimization-based HPS ----
+
+@inproceedings{SMPLify2016,
+  title={Keep it SMPL: Automatic estimation of 3D human pose and shape from a single image},
+  author={Bogo, Federica and Kanazawa, Angjoo and Lassner, Christoph and Gehler, Peter and Romero, Javier and Black, Michael J},
+  booktitle={European conference on computer vision},
+  pages={561--578},
+  year={2016},
+  organization={Springer}
+}
+
+% ---- Regression-based HPS ----
+@inproceedings{HMR2018,
+  title={End-to-end recovery of human shape and pose},
+  author={Kanazawa, Angjoo and Black, Michael J and Jacobs, David W and Malik, Jitendra},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={7122--7131},
+  year={2018}
+}
+
+
+@inproceedings{PyMAF2021,
+  title={Pymaf: 3d human pose and shape regression with pyramidal mesh alignment feedback loop},
+  author={Zhang, Hongwen and Tian, Yating and Zhou, Xinchi and Ouyang, Wanli and Liu, Yebin and Wang, Limin and Sun, Zhenan},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={11446--11456},
+  year={2021}
+}
+
+@inproceedings{CLIFF2022,
+  title={Cliff: Carrying location information in full frames into human pose and shape estimation},
+  author={Li, Zhihao and Liu, Jianzhuang and Zhang, Zhensong and Xu, Songcen and Yan, Youliang},
+  booktitle={European Conference on Computer Vision},
+  pages={590--606},
+  year={2022},
+  organization={Springer}
+}
+
+
+@inproceedings{SPIN2019,
+  title={Learning to reconstruct 3D human pose and shape via model-fitting in the loop},
+  author={Kolotouros, Nikos and Pavlakos, Georgios and Black, Michael J and Daniilidis, Kostas},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={2252--2261},
+  year={2019}
+}
+
+
+@inproceedings{PARE2021,
+  title={PARE: Part attention regressor for 3D human body estimation},
+  author={Kocabas, Muhammed and Huang, Chun-Hao P and Hilliges, Otmar and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={11127--11137},
+  year={2021}
+}
+
+
+@inproceedings{HybrIK2021,
+  title={Hybrik: A hybrid analytical-neural inverse kinematics solution for 3d human pose and shape estimation},
+  author={Li, Jiefeng and Xu, Chao and Chen, Zhicun and Bian, Siyuan and Yang, Lixin and Lu, Cewu},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={3383--3393},
+  year={2021}
+}
+
+
+@inproceedings{ReFit2023,
+  title={Refit: Recurrent fitting network for 3d human recovery},
+  author={Wang, Yufu and Daniilidis, Kostas},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={14644--14654},
+  year={2023}
+}
+
+
+@inproceedings{VIBE2020,
+  title={Vibe: Video inference for human body pose and shape estimation},
+  author={Kocabas, Muhammed and Athanasiou, Nikos and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={5253--5263},
+  year={2020}
+}
+
+@inproceedings{GLoT2023,
+  title={Global-to-local modeling for video-based 3d human pose and shape estimation},
+  author={Shen, Xiaolong and Yang, Zongxin and Wang, Xiaohan and Ma, Jianxin and Zhou, Chang and Yang, Yi},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={8887--8896},
+  year={2023}
+}
+
+
+@inproceedings{TokenHMR2024,
+  title={Tokenhmr: Advancing human mesh recovery with a tokenized pose representation},
+  author={Dwivedi, Sai Kumar and Sun, Yu and Patel, Priyanka and Feng, Yao and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={1323--1333},
+  year={2024}
+}
+
+% ---- Video-based HPS ----
+
+@inproceedings{TCMR2021,
+  title={Beyond static features for temporally consistent 3d human pose and shape from a video},
+  author={Choi, Hongsuk and Moon, Gyeongsik and Chang, Ju Yong and Lee, Kyoung Mu},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={1964--1973},
+  year={2021}
+}
+
+
+@inproceedings{MPSNet2022,
+  title={Capturing humans in motion: Temporal-attentive 3d human pose and shape estimation from monocular video},
+  author={Wei, Wen-Li and Lin, Jen-Chun and Liu, Tyng-Luh and Liao, Hong-Yuan Mark},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={13211--13220},
+  year={2022}
+}
+
+
+@inproceedings{PromptHMR2024,
+  title={Prompthmr: Promptable human mesh recovery},
+  author={Wang, Yufu and Sun, Yu and Patel, Priyanka and Daniilidis, Kostas and Black, Michael J and Kocabas, Muhammed},
+  booktitle={Proceedings of the computer vision and pattern recognition conference},
+  pages={1148--1159},
+  year={2025}
+}
+
+% ---- Global Motion Recovery ----
+
+@inproceedings{GLAMR2022,
+  title={Glamr: Global occlusion-aware human mesh recovery with dynamic cameras},
+  author={Yuan, Ye and Iqbal, Umar and Molchanov, Pavlo and Kitani, Kris and Kautz, Jan},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={11038--11049},
+  year={2022}
+}
+
+
+@inproceedings{SLAHMR2023,
+  title={Decoupling human and camera motion from videos in the wild},
+  author={Ye, Vickie and Pavlakos, Georgios and Malik, Jitendra and Kanazawa, Angjoo},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={21222--21232},
+  year={2023}
+}
+
+
+
+@inproceedings{PACE2024,
+  title={Pace: Human and camera motion estimation from in-the-wild videos},
+  author={Kocabas, Muhammed and Yuan, Ye and Molchanov, Pavlo and Guo, Yunrong and Black, Michael J and Hilliges, Otmar and Kautz, Jan and Iqbal, Umar},
+  booktitle={2024 International Conference on 3D Vision (3DV)},
+  pages={397--408},
+  year={2024},
+  organization={IEEE}
+}
+
+
+@inproceedings{WHAM2024,
+  title={Wham: Reconstructing world-grounded humans with accurate 3d motion},
+  author={Shin, Soyong and Kim, Juyong and Halilaj, Eni and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={2070--2080},
+  year={2024}
+}
+
+
+@inproceedings{TRACE2023,
+  title={Trace: 5d temporal regression of avatars with dynamic cameras in 3d environments},
+  author={Sun, Yu and Bao, Qian and Liu, Wu and Mei, Tao and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={8856--8866},
+  year={2023}
+}
+
+@inproceedings{TRAM2024,
+  title={Tram: Global trajectory and motion of 3d humans from in-the-wild videos},
+  author={Wang, Yufu and Wang, Ziyun and Liu, Lingjie and Daniilidis, Kostas},
+  booktitle={European Conference on Computer Vision},
+  pages={467--487},
+  year={2024},
+  organization={Springer}
+}
+
+% ---- SLAM ----
+
+@article{DROIDSLAM2021,
+  title={Droid-slam: Deep visual slam for monocular, stereo, and rgb-d cameras},
+  author={Teed, Zachary and Deng, Jia},
+  journal={Advances in neural information processing systems},
+  volume={34},
+  pages={16558--16569},
+  year={2021}
+}
+
+
+@article{MonST3R2024,
+  title={Monst3r: A simple approach for estimating geometry in the presence of motion},
+  author={Zhang, Junyi and Herrmann, Charles and Hur, Junhwa and Jampani, Varun and Darrell, Trevor and Cole, Forrester and Sun, Deqing and Yang, Ming-Hsuan},
+  journal={arXiv preprint arXiv:2410.03825},
+  year={2024}
+}
+
+% ---- Depth Estimation ----
+
+@article{Metric3D2024,
+  title={Metric3d v2: A versatile monocular geometric foundation model for zero-shot metric depth and surface normal estimation},
+  author={Hu, Mu and Yin, Wei and Zhang, Chi and Cai, Zhipeng and Long, Xiaoxiao and Chen, Hao and Wang, Kaixuan and Yu, Gang and Shen, Chunhua and Shen, Shaojie},
+  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  volume={46},
+  number={12},
+  pages={10579--10596},
+  year={2024},
+  publisher={IEEE}
+}
+
+% ---- 2D Keypoint Detection ----
+@article{ViTPose2022,
+  title={Vitpose: Simple vision transformer baselines for human pose estimation},
+  author={Xu, Yufei and Zhang, Jing and Zhang, Qiming and Tao, Dacheng},
+  journal={Advances in neural information processing systems},
+  volume={35},
+  pages={38571--38584},
+  year={2022}
+}
+
+% ---- Human Detection ----
+@inproceedings{YOLO,
+  title={YOLOv7: Trainable bag-of-freebies sets new state-of-the-art for real-time object detectors},
+  author={Wang, Chien-Yao and Bochkovskiy, Alexey and Liao, Hong-Yuan Mark},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={7464--7475},
+  year={2023}
+}
+
+% ---- Segmentation ----
+
+@inproceedings{SAM2023,
+  title={Segment anything},
+  author={Kirillov, Alexander and Mintun, Eric and Ravi, Nikhila and Mao, Hanzi and Rolland, Chloe and Gustafson, Laura and Xiao, Tete and Whitehead, Spencer and Berg, Alexander C and Lo, Wan-Yen and others},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={4015--4026},
+  year={2023}
+}
+
+% ---- Datasets ----
+
+@inproceedings{EMDB2023,
+  title={Emdb: The electromagnetic database of global 3d human pose and shape in the wild},
+  author={Kaufmann, Manuel and Song, Jie and Guo, Chen and Shen, Kaiyue and Jiang, Tianjian and Tang, Chengcheng and Z{\'a}rate, Juan Jos{\'e} and Hilliges, Otmar},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={14632--14643},
+  year={2023}
+}
+
+@inproceedings{3DPW2018,
+  title={Recovering accurate 3d human pose in the wild using imus and a moving camera},
+  author={Von Marcard, Timo and Henschel, Roberto and Black, Michael J and Rosenhahn, Bodo and Pons-Moll, Gerard},
+  booktitle={Proceedings of the European conference on computer vision (ECCV)},
+  pages={601--617},
+  year={2018}
+}
+
+% ---- Human-Scene Interaction / Downstream Tasks ----
+
+@inproceedings{Hassan2019,
+  title={Resolving 3D human pose ambiguities with 3D scene constraints},
+  author={Hassan, Mohamed and Choutas, Vasileios and Tzionas, Dimitrios and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={2282--2292},
+  year={2019}
+}
+
+
+@inproceedings{Embodied2022,
+  title={Virtualhome: Simulating household activities via programs},
+  author={Puig, Xavier and Ra, Kevin and Boben, Marko and Li, Jiaman and Wang, Tingwu and Fidler, Sanja and Torralba, Antonio},
+  booktitle={Proceedings of the IEEE conference on computer vision and pattern recognition},
+  pages={8494--8502},
+  year={2018}
+}
+
+
+@inproceedings{DigitalHuman2024,
+  title={Closet: Modeling clothed humans on continuous surface with explicit template decomposition},
+  author={Zhang, Hongwen and Lin, Siyou and Shao, Ruizhi and Zhang, Yuxiang and Zheng, Zerong and Huang, Han and Guo, Yandong and Liu, Yebin},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={501--511},
+  year={2023}
+}
+
+% =====================================================
+% NEW REFERENCES ADDED BELOW
+% =====================================================
+
+% ---- Large-scale HPS / Foundation Models ----
+
+@inproceedings{HMR2024,
+  title={Humans in 4d: Reconstructing and tracking humans with transformers},
+  author={Goel, Shubham and Pavlakos, Georgios and Rajasegaran, Jathushan and Kanazawa, Angjoo and Malik, Jitendra},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={14783--14794},
+  year={2023}
+}
+
+
+@article{SMPLerX2024,
+  title={Smpler-x: Scaling up expressive human pose and shape estimation},
+  author={Cai, Zhongang and Yin, Wanqi and Zeng, Ailing and Wei, Chen and Sun, Qingping and Yanjun, Wang and Pang, Hui En and Mei, Haiyi and Zhang, Mingyuan and Zhang, Lei and others},
+  journal={Advances in Neural Information Processing Systems},
+  volume={36},
+  pages={11454--11468},
+  year={2023}
+}
+
+
+@inproceedings{ScoreHMR2024,
+  title={Score-guided diffusion for 3d human recovery},
+  author={Stathopoulos, Anastasis and Han, Ligong and Metaxas, Dimitris},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={906--915},
+  year={2024}
+}
+
+
+@inproceedings{MultiHMR2024,
+  title={Multi-hmr: Multi-person whole-body human mesh recovery in a single shot},
+  author={Baradel, Fabien and Armando, Matthieu and Galaaoui, Salma and Br{\'e}gier, Romain and Weinzaepfel, Philippe and Rogez, Gr{\'e}gory and Lucas, Thomas},
+  booktitle={European Conference on Computer Vision},
+  pages={202--218},
+  year={2024},
+  organization={Springer}
+}
+
+
+@inproceedings{NIKI2023,
+  title={Niki: Neural inverse kinematics with invertible neural networks for 3d human pose and shape estimation},
+  author={Li, Jiefeng and Bian, Siyuan and Liu, Qi and Tang, Jiasheng and Wang, Fan and Lu, Cewu},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={12933--12942},
+  year={2023}
+}
+
+% ---- Global Motion Recovery (recent) ----
+
+@inproceedings{GVHMR2024,
+  title={World-grounded human motion recovery via gravity-view coordinates},
+  author={Shen, Zehong and Pi, Huaijin and Xia, Yan and Cen, Zhi and Peng, Sida and Hu, Zechen and Bao, Hujun and Hu, Ruizhen and Zhou, Xiaowei},
+  booktitle={SIGGRAPH Asia 2024 Conference Papers},
+  pages={1--11},
+  year={2024}
+}
+
+
+@inproceedings{HumanMM2025,
+  title={Humanmm: Global human motion recovery from multi-shot videos},
+  author={Zhang, Yuhong and Wu, Guanlin and Chen, Ling-Hao and Zhao, Zhuokai and Lin, Jing and Jiang, Xiaoke and Wu, Jiamin and Li, Zhuoheng and Yang, Hao Frank and Wang, Haoqian and others},
+  booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
+  pages={1973--1983},
+  year={2025}
+}
+
+
+@inproceedings{RoHM2024,
+  title={Rohm: Robust human motion reconstruction via diffusion},
+  author={Zhang, Siwei and Bhatnagar, Bharat Lal and Xu, Yuanlu and Winkler, Alexander and Kadlecek, Petr and Tang, Siyu and Bogo, Federica},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={14606--14617},
+  year={2024}
+}
+
+% ---- SLAM / Visual Odometry (recent) ----
+
+@article{DPVO2023,
+  title={Deep patch visual odometry},
+  author={Teed, Zachary and Lipson, Lahav and Deng, Jia},
+  journal={Advances in Neural Information Processing Systems},
+  volume={36},
+  pages={39033--39051},
+  year={2023}
+}
+
+
+@article{ORBSLAM3,
+  title={Orb-slam3: An accurate open-source library for visual, visual--inertial, and multimap slam},
+  author={Campos, Carlos and Elvira, Richard and Rodr{\'\i}guez, Juan J G{\'o}mez and Montiel, Jos{\'e} MM and Tard{\'o}s, Juan D},
+  journal={IEEE transactions on robotics},
+  volume={37},
+  number={6},
+  pages={1874--1890},
+  year={2021},
+  publisher={IEEE}
+}
+
+@inproceedings{DUSt3R2024,
+  title={Dust3r: Geometric 3d vision made easy},
+  author={Wang, Shuzhe and Leroy, Vincent and Cabon, Yohann and Chidlovskii, Boris and Revaud, Jerome},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={20697--20709},
+  year={2024}
+}
+
+
+@inproceedings{MASt3RSLAM2025,
+  title={Mast3r-slam: Real-time dense slam with 3d reconstruction priors},
+  author={Murai, Riku and Dexheimer, Eric and Davison, Andrew J},
+  booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
+  pages={16695--16705},
+  year={2025}
+}
+
+% ---- Depth Estimation (recent) ----
+
+@article{DepthAnythingV2,
+  title={Depth anything v2},
+  author={Yang, Lihe and Kang, Bingyi and Huang, Zilong and Zhao, Zhen and Xu, Xiaogang and Feng, Jiashi and Zhao, Hengshuang},
+  journal={Advances in Neural Information Processing Systems},
+  volume={37},
+  pages={21875--21911},
+  year={2024}
+}
+
+@article{DepthPro2024,
+  title={Depth pro: Sharp monocular metric depth in less than a second},
+  author={Bochkovskii, Aleksei and Delaunoy, Ama{\~a}{\c{G}}l and Germain, Hugo and Santos, Marcel and Zhou, Yichao and Richter, Stephan R and Koltun, Vladlen},
+  journal={arXiv preprint arXiv:2410.02073},
+  year={2024}
+}
+
+@inproceedings{UniDepth2024,
+  title={Unidepth: Universal monocular metric depth estimation},
+  author={Piccinelli, Luigi and Yang, Yung-Hsu and Sakaridis, Christos and Segu, Mattia and Li, Siyuan and Van Gool, Luc and Yu, Fisher},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={10106--10116},
+  year={2024}
+}
+
+@article{ZoeDepth2023,
+  title={Zoedepth: Zero-shot transfer by combining relative and metric depth},
+  author={Bhat, Shariq Farooq and Birkl, Reiner and Wofk, Diana and Wonka, Peter and M{\"u}ller, Matthias},
+  journal={arXiv preprint arXiv:2302.12288},
+  year={2023}
+}
+
+% ---- Dynamic Scene / Human-aware Reconstruction ----
+
+@article{DynaSLAM2018,
+  title={DynaSLAM: Tracking, mapping, and inpainting in dynamic scenes},
+  author={Bescos, Berta and F{\'a}cil, Jos{\'e} M and Civera, Javier and Neira, Jos{\'e}},
+  journal={IEEE robotics and automation letters},
+  volume={3},
+  number={4},
+  pages={4076--4083},
+  year={2018},
+  publisher={IEEE}
+}
+
+% ---- Motion Generation / Prior Models ----
+@article{MDM2023,
+  title={Human motion diffusion model},
+  author={Tevet, Guy and Raab, Sigal and Gordon, Brian and Shafir, Yonatan and Cohen-Or, Daniel and Bermano, Amit H},
+  journal={arXiv preprint arXiv:2209.14916},
+  year={2022}
+}
+
+
+@inproceedings{HuMoR2022,
+  title={Humor: 3d human motion model for robust pose estimation},
+  author={Rempe, Davis and Birdal, Tolga and Hertzmann, Aaron and Yang, Jimei and Sridhar, Srinath and Guibas, Leonidas J},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={11488--11499},
+  year={2021}
+}
+
+% ---- Human-Scene Interaction / Embodied AI ----
+@inproceedings{EmbodiedScan2024,
+  title={Embodiedscan: A holistic multi-modal 3d perception suite towards embodied ai},
+  author={Wang, Tai and Mao, Xiaohan and Zhu, Chenming and Xu, Runsen and Lyu, Ruiyuan and Li, Peisen and Chen, Xiao and Zhang, Wenwei and Chen, Kai and Xue, Tianfan and others},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={19757--19767},
+  year={2024}
+}
+
+@inproceedings{PhysDiff2023,
+  title={Physdiff: Physics-guided human motion diffusion model},
+  author={Yuan, Ye and Song, Jiaming and Iqbal, Umar and Vahdat, Arash and Kautz, Jan},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={16010--16021},
+  year={2023}
+}
+
+% ---- 2D Keypoint / Pose (additional) ----
+@article{RTMPose2023,
+  title={Rtmpose: Real-time multi-person pose estimation based on mmpose},
+  author={Jiang, Tao and Lu, Peng and Zhang, Li and Ma, Ningsheng and Han, Rui and Lyu, Chengqi and Li, Yining and Chen, Kai},
+  journal={arXiv preprint arXiv:2303.07399},
+  year={2023}
+}
+
+% ---- Datasets (additional) ----
+@inproceedings{BEDLAM2023,
+  title={Bedlam: A synthetic dataset of bodies exhibiting detailed lifelike animated motion},
+  author={Black, Michael J and Patel, Priyanka and Tesch, Joachim and Yang, Jinlong},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={8726--8737},
+  year={2023}
+}
+
+@inproceedings{RICH2022,
+  title={Capturing and inferring dense full-body human-scene contact},
+  author={Huang, Chun-Hao P and Yi, Hongwei and H{\"o}schle, Markus and Safroshkin, Matvey and Alexiadis, Tsvetelina and Polikovsky, Senya and Scharstein, Daniel and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={13274--13285},
+  year={2022}
+}
+
+@article{H36M2014,
+  title={Human3. 6m: Large scale datasets and predictive methods for 3d human sensing in natural environments},
+  author={Ionescu, Catalin and Papava, Dragos and Olaru, Vlad and Sminchisescu, Cristian},
+  journal={IEEE transactions on pattern analysis and machine intelligence},
+  volume={36},
+  number={7},
+  pages={1325--1339},
+  year={2013},
+  publisher={IEEE}
+}
+
+@article{shivkumar2025hierarchical,
+  title={Hierarchical motion perception as causal inference},
+  author={Shivkumar, Sabyasachi and DeAngelis, Gregory C and Haefner, Ralf M},
+  journal={Nature Communications},
+  volume={16},
+  number={1},
+  pages={3868},
+  year={2025},
+  publisher={Nature Publishing Group UK London}
+}
+@article{giese2003neural,
+  title={Neural mechanisms for the recognition of biological movements},
+  author={Giese, Martin A and Poggio, Tomaso},
+  journal={Nature Reviews Neuroscience},
+  volume={4},
+  number={3},
+  pages={179--192},
+  year={2003},
+  publisher={Nature Publishing Group UK London}
+}
+
+%新增 video base HMR：
+@inproceedings{kanazawa2019learning,
+  title={Learning 3d human dynamics from video},
+  author={Kanazawa, Angjoo and Zhang, Jason Y and Felsen, Panna and Malik, Jitendra},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={5614--5623},
+  year={2019}
+}
+
+@inproceedings{luo20203d,
+  title={3d human motion estimation via motion compression and refinement},
+  author={Luo, Zhengyi and Golestaneh, S Alireza and Kitani, Kris M},
+  booktitle={Proceedings of the Asian Conference on Computer Vision},
+  year={2020}
+}
+%from claude
+% 1. AMASS — large-scale motion capture dataset
+@inproceedings{AMASS2019,
+  title={AMASS: Archive of motion capture as surface shapes},
+  author={Mahmood, Naureen and Ghorbani, Nima and Troje, Nikolaus F and Pons-Moll, Gerard and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={5442--5451},
+  year={2019}
+}
+
+% 2. WHAC — world-grounded humans and cameras
+@inproceedings{WHAC2024,
+  title={Whac: World-grounded humans and cameras},
+  author={Yin, Wanqi and Cai, Zhongang and Wang, Ruisi and Wang, Fanzhou and Wei, Chen and Mei, Haiyi and Xiao, Weiye and Yang, Zhitao and Sun, Qingping and Yamashita, Atsushi and others},
+  booktitle={European Conference on Computer Vision},
+  pages={20--37},
+  year={2024},
+  organization={Springer}
+}
+
+% 3. CameraHMR — camera-aware human mesh recovery
+@article{CameraHMR2024,
+  title={Camerahmr: Aligning people with perspective},
+  author={Patel, Priyanka and Black, Michael J},
+  booktitle={2025 International Conference on 3D Vision (3DV)},
+  pages={1562--1571},
+  year={2025},
+  organization={IEEE}
+}
+% 4. Sapiens — foundation for human vision models
+@inproceedings{Sapiens2024,
+  title={Sapiens: Foundation for human vision models},
+  author={Khirodkar, Rawal and Bagautdinov, Timur and Martinez, Julieta and Zhaoen, Su and James, Austin and Selednik, Peter and Anderson, Stuart and Saito, Shunsuke},
+  booktitle={European Conference on Computer Vision},
+  pages={206--228},
+  year={2024},
+  organization={Springer}
+}
+
+% 5. SMPL-X — expressive body model with hands and face
+@inproceedings{SMPLX2019,
+  title={Expressive body capture: 3d hands, face, and body from a single image},
+  author={Pavlakos, Georgios and Choutas, Vasileios and Ghorbani, Nima and Bolkart, Timo and Osman, Ahmed AA and Tzionas, Dimitrios and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF conference on computer vision and pattern recognition},
+  pages={10975--10985},
+  year={2019}
+}
+% 6. MotionBERT — unified human motion representation learning
+@inproceedings{MotionBERT2023,
+  title={Motionbert: A unified perspective on learning human motion representations},
+  author={Zhu, Wentao and Ma, Xiaoxuan and Liu, Zhaoyang and Liu, Libin and Wu, Wayne and Wang, Yizhou},
+  booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
+  pages={15085--15099},
+  year={2023}
+}
+
+% 7. EgoBody — egocentric human body dataset
+@inproceedings{EgoBody2022,
+  title={Egobody: Human body shape and motion of interacting people from head-mounted devices},
+  author={Zhang, Siwei and Ma, Qianli and Zhang, Yan and Qian, Zhiyin and Kwon, Taein and Pollefeys, Marc and Bogo, Federica and Tang, Siyu},
+  booktitle={European conference on computer vision},
+  pages={180--200},
+  year={2022},
+  organization={Springer}
+}
+% 8. RAFT — optical flow estimation
+@inproceedings{RAFT2020,
+    title={Raft: Recurrent all-pairs field transforms for optical flow},
+  author={Teed, Zachary and Deng, Jia},
+  booktitle={European conference on computer vision},
+  pages={402--419},
+  year={2020},
+  organization={Springer}
+}
+% 9. SPEC — camera-aware human pose estimation
+@inproceedings{SPEC2021,
+  title={SPEC: Seeing people in the wild with an estimated camera},
+  author={Kocabas, Muhammed and Huang, Chun-Hao P and Tesch, Joachim and M{\"u}ller, Lea and Hilliges, Otmar and Black, Michael J},
+  booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision},
+  pages={11035--11045},
+  year={2021}
+}
+
+% 10. CLIP — contrastive language-image pretraining
+@inproceedings{CLIP2021,
+  title={Learning transferable visual models from natural language supervision},
+  author={Radford, Alec and Kim, Jong Wook and Hallacy, Chris and Ramesh, Aditya and Goh, Gabriel and Agarwal, Sandhini and Sastry, Girish and Askell, Amanda and Mishkin, Pamela and Clark, Jack and others},
+  booktitle={International conference on machine learning},
+  pages={8748--8763},
+  year={2021},
+  organization={PmLR}
+}

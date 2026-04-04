@@ -20,7 +20,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-figures/trajectory}"
 # 方法列表（格式: "Label:result_dir"）
 METHODS=(
     "${M1:-Ours:results/gvhmr_base_warmstart}"
-    "${M2:-PromptHMR:results/promptbase_video_warmstart_emdb2}"
+    "${M2:-PromptHMR:results/promptbase_video_depthrefine_emdb2_woMask}"
     "${M3:-}"
     "${M4:-}"
 )

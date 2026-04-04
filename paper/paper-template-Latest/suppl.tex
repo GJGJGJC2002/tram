@@ -1,0 +1,117 @@
+\documentclass[runningheads]{llncs}
+
+% ---------------------------------------------------------------
+% Include basic ECCV package (与主论文保持一致)
+
+% TODO FINAL: Comment out the following line for the camera-ready version
+\usepackage[review,year=2026,ID=9159]{eccv}
+% TODO FINAL: Un-comment the following line for the camera-ready version
+%\usepackage{eccv}
+
+% ---------------------------------------------------------------
+% Other packages (与主论文保持一致)
+
+\usepackage{eccvabbrv}
+
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{amssymb}
+
+\usepackage[accsupp]{axessibility}
+
+% TODO FINAL: Comment out the following line for the camera-ready version
+% \usepackage[pagebackref,breaklinks,colorlinks,citecolor=eccvblue]{hyperref}
+% TODO FINAL: Un-comment the following line for the camera-ready version
+\usepackage{hyperref}
+
+\usepackage{orcidlink}
+
+% Graphics path
+\graphicspath{{images/}}
+
+% ---------------------------------------------------------------
+% 补充材料 section 编号改为 A, B, C...
+\renewcommand{\thesection}{\Alph{section}}
+% 补充材料 figure/table 编号前加 S 前缀，与主论文区分
+\renewcommand{\thefigure}{S\arabic{figure}}
+\renewcommand{\thetable}{S\arabic{table}}
+\renewcommand{\theequation}{S\arabic{equation}}
+
+% ---------------------------------------------------------------
+
+\begin{document}
+
+\title{EIHMR: Collaborative Human-Camera Estimation for Global Human Mesh Recovery\\
+\textbf{--- Supplementary Material ---}}
+
+\titlerunning{EIHMR -- Supplementary Material}
+
+\author{Anonymous ECCV 2026 Submission}
+\authorrunning{ECCV 2026 Submission \#9159}
+\institute{Paper ID \#9159}
+
+\maketitle
+
+
+% ===================================================================
+% A. Implementation Details
+% ===================================================================
+\section{Implementation Details}
+\label{sec:suppl-impl}
+
+\subsection{SA-LHMR Implementation Details}
+\label{sec:suppl-salmhr-impl}
+
+In FK Root Correction, a joint is considered static when its confidence exceeds 0.5 and its inter-frame displacement is below 3\,cm. In Contact-Aware IK, the penetration tolerance is $\epsilon = 2$\,cm; the optimization objective combines a contact loss, pose regularization (weight 0.01), and temporal smoothness (weight 0.05), all using the Geman--McClure robust kernel to suppress the influence of outlier depth estimates.
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.95\linewidth]{images/SA-LHMR-Ablation.pdf}
+  \caption{\textbf{Qualitative ablation of SA-LHMR components.} Without FK Root Correction, foot positions shift significantly across frames, producing visible sliding. Without Contact-Aware IK, feet fail to align precisely with the ground surface.}
+  \label{fig:suppl-ablation-salmhr}
+\end{figure*}
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=\linewidth]{images/MO-Ablation (1).pdf}
+  \caption{\textbf{Qualitative ablation of MO-SLAM components.} Without Timestep Color Encoding, rendered meshes appear as uniform gray, and the blue trajectory drifts severely in both scenes. Without Adaptive Image Replacement, in a texture-rich indoor scene, overriding the background with rendered content degrades feature matching, causing significant trajectory drift.}
+  \label{fig:suppl-ablation-moslam}
+\end{figure*}
+
+
+
+\subsection{MO-SLAM Implementation Details}
+\label{sec:suppl-moslam-impl}
+
+We replace the original MotionFilter with a WarmstartMotionFilter that bypasses optical-flow-based frame selection. Frames selected as sliding-window centers are directly set as keyframes, with SE3 poses and disparity maps from the first-pass SLAM injected as warm-start initialization. For each keyframe, we compute the grayscale Laplacian variance of the background region as a texture score; when the score falls below a threshold $\tau = 40$, the rendered image replaces the original, otherwise the original masked image is retained. In the Backend DBA solver, we always use the masked images and zero out the confidence weights of human-mask pixels to avoid interference from mismatched human models.
+
+
+
+% ===================================================================
+% B. Ablation Visualization
+% ===================================================================
+\section{Ablation Visualization}
+\label{sec:suppl-ablation-vis}
+
+In the main paper, we presented quantitative ablation results on EMDB2. Here we provide qualitative visualizations to complement those numbers and offer an intuitive understanding of each component's contribution.
+
+\subsection{Effect of SA-LHMR Components}
+
+\noindent\textbf{FK Root Correction.}
+Removing FK Root Correction causes the overlaid foot positions to shift laterally across frames, resulting in pronounced sliding artifacts---particularly visible in the standing and crouching sequences. In contrast, the full model produces temporally stable foot contacts. FK Root Correction detects static joints via forward kinematics and corrects the root displacement accordingly. This is especially critical when initial camera parameters are severely erroneous, as FK can restore correct motion trajectories from a kinematics perspective and significantly eliminate foot sliding.
+
+\noindent\textbf{Contact-Aware IK.}
+When removing Contact-Aware IK, feet fail to align precisely with the ground surface, with visible penetration or floating in some frames. With the full model, foot contours are sharper and consistent with scene depth at contact points. Contact-Aware IK adjusts contact joints onto scene surfaces via depth-guided inverse kinematics, ensuring physically plausible human-scene interaction and improving the accuracy of motion details such as foot-ground contact.
+
+
+\subsection{Effect of MO-SLAM Components}
+
+
+\noindent\textbf{Timestep Color Encoding.}
+As shown in the left-group insets of \cref{fig:suppl-ablation-moslam}, without golden-angle HSV color encoding, all rendered SMPL meshes share a uniform gray appearance. As the human moves across consecutive frames, these gray meshes mutually occlude each other, forming a large textureless region that not only fails to provide matching cues but actively interferes with the feature extraction network's encoding of real scene features. The blue trajectory drifts severely in both the outdoor and indoor scenes. In contrast, our method assigns each frame's mesh a unique HSV color, making meshes at different timesteps visually distinguishable and providing unambiguous inter-frame correspondence for SLAM.
+
+\noindent\textbf{Adaptive Image Replacement.}
+As shown in the right group of \cref{fig:suppl-ablation-moslam}, without adaptive image replacement, all forced keyframes unconditionally use rendered images. In a texture-scarce background, the difference is minimal and the blue trajectory remains close to green. However, in a texture-rich background with door frames, chairs, and floor patterns, unconditionally overriding the background replaces high-quality natural features with synthetic SMPL surfaces, degrading SLAM feature matching. The adaptive strategy evaluates background texture richness via Laplacian variance: using rendered images when texture is scarce and preserving original images when texture is rich, thereby maintaining stable camera estimation across both scenarios.
+
+
+\end{document}
